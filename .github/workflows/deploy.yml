@@ -1,0 +1,91 @@
+name: Release & Deploy to Clojars
+
+# A tag is the release. `SKJEMA_VERSION` at the repo root is the only version
+# source, so the tag must equal it — the deploy step reads the tag back out of
+# the environment and build.clj refuses a mismatch rather than publishing a
+# number nobody asked for. Clojars is irreversible: the gate runs first and the
+# push happens last.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    name: Release & Deploy to Clojars
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Tag must equal SKJEMA_VERSION
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DECLARED=$(tr -d '[:space:]' < SKJEMA_VERSION)
+          if [ "$VERSION" != "$DECLARED" ]; then
+            echo "tag $GITHUB_REF_NAME does not match SKJEMA_VERSION $DECLARED"
+            exit 1
+          fi
+
+      - uses: DeLaGuardo/setup-clojure@13.6.1
+        with:
+          cli: latest
+
+      - name: Cache Clojure deps
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+            ~/.clojure/.cpcache
+          key: deps-${{ runner.os }}-${{ hashFiles('deps.edn') }}
+          restore-keys: |
+            deps-${{ runner.os }}-
+
+      - name: Test
+        run: clojure -M:test
+
+      - name: Generate release notes
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | head -n 2 | tail -n 1)
+          CURRENT_TAG=${GITHUB_REF_NAME}
+          if [ -z "$PREV_TAG" ] || [ "$PREV_TAG" = "$CURRENT_TAG" ]; then
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" "$CURRENT_TAG")
+          else
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" "${PREV_TAG}..${CURRENT_TAG}")
+          fi
+          {
+            echo "## What's Changed"
+            echo ""
+            echo "$CHANGELOG"
+          } > /tmp/release_body.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: /tmp/release_body.md
+
+      - name: Check if version exists on Clojars
+        id: check-clojars
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://repo.clojars.org/com/blockether/skjema/$VERSION/skjema-$VERSION.jar")
+          if [ "$STATUS" = "200" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Version $VERSION already exists on Clojars — skipping deploy"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build & Deploy to Clojars
+        if: steps.check-clojars.outputs.exists != 'true'
+        env:
+          SKJEMA_VERSION: ${{ github.ref_name }}
+          CLOJARS_USERNAME: blockether-deployer
+          CLOJARS_PASSWORD: ${{ secrets.CLOJARS_DEPLOY_TOKEN }}
+        run: clojure -T:build deploy
