@@ -27,4 +27,15 @@
   {:extra-paths ["test"]
    :extra-deps  {org.clojure/clojure            {:mvn/version "1.12.4"}
                  io.github.noahtheduke/lazytest {:mvn/version "2.0.0"}}
-   :main-opts   ["-m" "lazytest.main" "test"]}}}
+   :main-opts   ["-m" "lazytest.main" "test"]}
+
+  ;; The speed claim, kept honest: `bench/` measures this validator against
+  ;; malli on the very same Clojure data, both sides prepared once. It is not
+  ;; on the test classpath — a benchmark dependency is not a library
+  ;; dependency, and nothing in `src` may ever require it.
+  :bench
+  {:extra-paths ["bench"]
+   :extra-deps  {org.clojure/clojure {:mvn/version "1.12.4"}
+                 metosin/malli       {:mvn/version "0.20.1"}
+                 criterium/criterium {:mvn/version "0.4.6"}}
+   :main-opts   ["-m" "com.blockether.skjema.bench"]}}}
