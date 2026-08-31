@@ -85,6 +85,34 @@ a resource that declares 2019-09, draft-07, draft-06 or draft-04 is read with
 the keywords THAT draft defines, so `$recursiveRef` is recognized without being
 followed.
 
+## Speed
+
+`clojure -M:bench` measures the same data against
+[malli](https://github.com/metosin/malli), both sides prepared once, with
+criterium. One machine's medians — run it on yours:
+
+| what | skjema | malli |
+|---|---|---|
+| object of 9 members, valid | 2.8 us | 0.32 us |
+| the same object, two members wrong | 0.75 us | 0.11 us |
+| the same object, errors reported | 5.0 us | 0.58 us |
+| one string, `minLength`/`maxLength` | 110 ns | 13 ns |
+| array of 1000 integers with bounds | 100 us | 8.3 us |
+| preparing the schema itself | 35 us | 5.3 us |
+
+malli compiles a schema written in its own language down to closures; `skjema`
+walks a JSON document the specification defines keyword by keyword, and stays
+within an order of magnitude of it. What it costs is decided when the schema is
+compiled, never per instance:
+
+- every node carries a **bitmask of the keywords it holds**, so a node is asked
+  about the twenty-odd keywords it does NOT carry with one bit test and no map
+  lookup;
+- `valid?` is **fail-fast and location-free** — it stops at the first refusal
+  and never builds the JSON Pointers only an error would print;
+- **annotations are built only for a document that says `unevaluatedProperties`
+  or `unevaluatedItems`**, because nothing else can read them;
+- `$ref` resolution is cached per compiled schema.
 ## License
 
 MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE).

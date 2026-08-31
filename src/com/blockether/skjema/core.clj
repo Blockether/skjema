@@ -41,6 +41,10 @@
    turns the pathological schema into an error a caller can catch."
   2048)
 
+(defrecord Ctx
+  [index dynamic ref-cache base dyn-scope validation? format-assertion? format?
+   annotate? quiet? id-resolved inst-path kw-path res-prefix res-path depth dialect])
+
 (def ^:private validation-vocabulary
   "https://json-schema.org/draft/2020-12/vocab/validation")
 
@@ -104,10 +108,35 @@
     (sequential? x) (mapv canonical x)
     :else x))
 
-(defn- json-equal? [a b] (= (canonical a) (canonical b)))
-
 (defn- num-compare ^long [a b]
-  (long (.compareTo (bigdec a) (bigdec b))))
+  ;; `1`, `1.0` and `1.00` are one JSON number and only BigDecimal compares all
+  ;; of them without losing a digit - but two Longs, or two Doubles, are the
+  ;; case that actually turns up, and neither needs one. The Double branch
+  ;; compares by < and > rather than `Double/compare` so that -0.0 and 0.0 stay
+  ;; the same number, as BigDecimal has them.
+  (cond
+    (and (instance? Long a) (instance? Long b))
+    (Long/compare (long a) (long b))
+
+    (and (instance? Double a) (instance? Double b))
+    (let [x (double a) y (double b)]
+      (cond (< x y) -1 (> x y) 1 :else 0))
+
+    :else (long (.compareTo (bigdec a) (bigdec b)))))
+
+(defn- json-equal?
+  "JSON equality: numbers by VALUE, everything else structurally. Scalars are
+   answered where they stand, because canonicalizing a string or a Long into a
+   comparable shape allocates more than the comparison saves."
+  [a b]
+  (cond
+    (and (string? a) (string? b)) (.equals ^String a ^String b)
+    (and (number? a) (number? b)) (zero? (num-compare a b))
+    (or (nil? a) (nil? b)) (and (nil? a) (nil? b))
+    (or (instance? Boolean a) (instance? Boolean b))
+    (and (instance? Boolean a) (instance? Boolean b) (= a b))
+    (or (string? a) (string? b) (number? a) (number? b)) false
+    :else (= (canonical a) (canonical b))))
 
 (defn- multiple-of? [x divisor]
   (let [^BigDecimal bx (bigdec x)
@@ -122,6 +151,12 @@
 
 ;; The schema index: resources, anchors and dynamic anchors
 
+(def ^:private unevaluated-keywords
+  "The two keywords whose meaning is 'whatever the rest of this schema did NOT
+   evaluate'. They are the only reason an evaluation has to remember which
+   members it touched, so a document that never uses them never pays for it."
+  #{"unevaluatedProperties" "unevaluatedItems"})
+
 (def ^:private subschema-keywords
   #{"additionalProperties" "contains" "contentSchema" "else" "if" "items" "not"
     "propertyNames" "then" "unevaluatedItems" "unevaluatedProperties"})
@@ -133,6 +168,122 @@
   #{"$defs" "definitions" "dependencies" "dependentSchemas" "patternProperties"
     "properties"})
 
+;; The keyword mask: what a schema node CARRIES, decided once
+
+(defmacro ^:private has?
+  "Whether a node's mask carries this keyword group. A schema node is a map of
+   at most a handful of keywords, but the evaluation knows twenty-odd it could
+   contain: the mask is how a node stops being asked about the ones it does
+   not, once per compiled schema instead of once per instance."
+  [m bit]
+  `(not (zero? (bit-and (long ~m) ~bit))))
+
+(def ^:private keyword-mask
+  "One bit for every keyword the evaluation would otherwise have to look up.
+   The order is arbitrary; only the count matters, and it has to stay inside a
+   long."
+  (zipmap ["$ref" "$dynamicRef" "allOf" "anyOf" "oneOf" "not" "if"
+           "dependentSchemas" "dependencies"
+           "properties" "patternProperties" "additionalProperties"
+           "propertyNames" "prefixItems" "items" "contains"
+           "unevaluatedProperties" "unevaluatedItems"
+           "format" "$id" "$schema"
+           "type" "enum" "const"
+           "multipleOf" "maximum" "exclusiveMaximum" "minimum" "exclusiveMinimum"
+           "maxLength" "minLength" "pattern"
+           "maxItems" "minItems" "uniqueItems"
+           "maxProperties" "minProperties" "required" "dependentRequired"]
+          (iterate #(bit-shift-left ^long % 1) 1)))
+
+(defmacro ^:private defmask
+  "Name the bit a keyword lights up, or the bits a group of them share. A
+   keyword `keyword-mask` does not know fails the compilation here rather than
+   quietly naming nothing."
+  [sym & kws]
+  `(def ~(vary-meta sym assoc :private true :const true)
+     ~(reduce (fn [acc kw]
+                (bit-or (long acc)
+                        (long (or (keyword-mask kw)
+                                  (throw (ex-info (str "no mask bit for " kw) {:keyword kw}))))))
+              0
+              kws)))
+
+(defmask m-ref "$ref")
+(defmask m-dynamic-ref "$dynamicRef")
+(defmask m-all-of "allOf")
+(defmask m-any-of "anyOf")
+(defmask m-one-of "oneOf")
+(defmask m-not "not")
+(defmask m-if "if")
+(defmask m-dependent-schemas "dependentSchemas")
+(defmask m-dependencies "dependencies")
+(defmask m-object "properties" "patternProperties" "additionalProperties")
+(defmask m-property-names "propertyNames")
+(defmask m-array "prefixItems" "items")
+(defmask m-contains "contains")
+(defmask m-unevaluated-props "unevaluatedProperties")
+(defmask m-unevaluated-items "unevaluatedItems")
+(defmask m-format "format")
+(defmask m-id "$id")
+(defmask m-dialect "$schema")
+(defmask m-type "type")
+(defmask m-enum "enum")
+(defmask m-const "const")
+(defmask m-multiple-of "multipleOf")
+(defmask m-maximum "maximum")
+(defmask m-exclusive-maximum "exclusiveMaximum")
+(defmask m-minimum "minimum")
+(defmask m-exclusive-minimum "exclusiveMinimum")
+(defmask m-max-length "maxLength")
+(defmask m-min-length "minLength")
+(defmask m-pattern "pattern")
+(defmask m-max-items "maxItems")
+(defmask m-min-items "minItems")
+(defmask m-unique-items "uniqueItems")
+(defmask m-max-properties "maxProperties")
+(defmask m-min-properties "minProperties")
+(defmask m-required "required")
+(defmask m-dependent-required "dependentRequired")
+(defmask m-numbers "multipleOf" "maximum" "exclusiveMaximum" "minimum" "exclusiveMinimum")
+(defmask m-strings "maxLength" "minLength" "pattern")
+(defmask m-arrays "maxItems" "minItems" "uniqueItems")
+(defmask m-objects "maxProperties" "minProperties" "required" "dependentRequired")
+(defmask m-assertions
+  "type" "enum" "const"
+  "multipleOf" "maximum" "exclusiveMaximum" "minimum" "exclusiveMinimum"
+  "maxLength" "minLength" "pattern"
+  "maxItems" "minItems" "uniqueItems"
+  "maxProperties" "minProperties" "required" "dependentRequired")
+
+(defn- compute-mask
+  "The mask of a node read straight off its keys."
+  ^long [schema]
+  (reduce-kv (fn [^long acc k _]
+               (if-let [bit (keyword-mask k)] (bit-or acc (long bit)) acc))
+             0
+             schema))
+
+(defn- mask
+  "The mask `with-masks` attached, or the one this node has to be read for -
+   a node the compiler never saw, such as the view a legacy dialect makes."
+  ^long [schema]
+  (let [m (::mask (meta schema))]
+    (if m (long m) (compute-mask schema))))
+
+(defn- with-masks
+  "Attach every node's mask ONCE, when the schema is compiled. Nothing else in
+   the document changes, so a mask on a value that is not a schema - inside an
+   `enum`, say - is paid for at compile time and never read."
+  [x]
+  (cond
+    (map? x)
+    (with-meta (persistent! (reduce-kv (fn [acc k v] (assoc! acc k (with-masks v)))
+                                       (transient {})
+                                       x))
+               (assoc (meta x) ::mask (compute-mask x)))
+
+    (sequential? x) (mapv with-masks x)
+    :else x))
 (defn- index-schema
   "Record every identifier `schema` declares, descending ONLY through keywords
    that hold schemas. Walking every object instead would read a `$id` inside a
@@ -159,7 +310,9 @@
         (fn [acc k v]
           (let [kptr (str ptr "/" (uri/escape-token k))]
             (cond
-              (subschema-keywords k) (index-schema acc v base kptr)
+              (subschema-keywords k)
+              (index-schema (cond-> acc (unevaluated-keywords k) (assoc :unevaluated? true))
+                            v base kptr)
 
               (and (subschema-array-keywords k) (sequential? v))
               (first (reduce (fn [[acc i] sub]
@@ -218,45 +371,102 @@
 
 (def ^:private ok {:valid? true :props #{} :items #{} :errors []})
 
+(def ^:private nope
+  "The verdict a fail-fast run answers instead of an error. `valid?` asks for
+   the verdict and nothing else, so the message and the three locations that
+   would explain it are never built."
+  {:valid? false :props #{} :items #{} :errors []})
+
 (defn- merge-res [a b]
-  {:valid? (and (:valid? a) (:valid? b))
-   :props (into (:props a) (:props b))
-   :items (into (:items a) (:items b))
-   :errors (into (:errors a) (:errors b))})
+  (cond
+    (identical? a ok) b
+    (identical? b ok) a
+    :else
+    (let [pa (:props a) pb (:props b)
+          ia (:items a) ib (:items b)
+          ea (:errors a) eb (:errors b)]
+      {:valid? (and (:valid? a) (:valid? b))
+       :props (cond (empty? pb) pa (empty? pa) pb :else (into pa pb))
+       :items (cond (empty? ib) ia (empty? ia) ib :else (into ia ib))
+       :errors (cond (empty? eb) ea (empty? ea) eb :else (into ea eb))})))
 
 (defn- child-res
   "A child applicator's result WITHOUT its annotations: what `properties`
    evaluated inside `/foo` says nothing about what was evaluated at `/`."
   [r]
-  (assoc r :props #{} :items #{}))
+  (if (and (empty? (:props r)) (empty? (:items r)))
+    r
+    (assoc r :props #{} :items #{})))
 
 (defn- quiet
   "Keep a subschema's annotations, drop its errors - for a branch whose failure
    is not the schema's failure (`anyOf`, `if`)."
   [r]
-  (assoc r :errors []))
+  (if (empty? (:errors r)) r (assoc r :errors [])))
+
+(defn- pointer
+  "A JSON Pointer, from a resource-relative `prefix` and the tokens walked since
+   it. Locations travel as PATHS while evaluation runs and become strings only
+   here, where an error has to name where it happened: an instance that
+   validates never pays for a string nobody reads."
+  ^String [^String prefix tokens]
+  (if (zero? (count tokens))
+    (or prefix "")
+    (let [sb (StringBuilder. (or prefix ""))]
+      (reduce (fn [^StringBuilder sb t]
+                (-> sb
+                    (.append "/")
+                    (.append (uri/escape-token (if (string? t) t (str t))))))
+              sb
+              tokens)
+      (.toString sb))))
 
 (defn- at-keyword
   "Descend into a keyword of the CURRENT schema: both the keyword location from
-   the root and the pointer inside the current resource move."
-  [ctx & tokens]
-  (let [suffix (apply str (map #(str "/" (uri/escape-token (str %))) tokens))]
-    (-> ctx
-        (update :kw-loc str suffix)
-        (update :res-loc str suffix))))
+   the root and the pointer inside the current resource move. A fail-fast run
+   answers a verdict and never a location, so it pays for neither."
+  ([ctx a]
+   (if (:quiet? ctx)
+     ctx
+     (-> ctx (update :kw-path conj a) (update :res-path conj a))))
+  ([ctx a b]
+   (if (:quiet? ctx)
+     ctx
+     (-> ctx (update :kw-path conj a b) (update :res-path conj a b)))))
 
 (defn- at-instance [ctx token]
-  (update ctx :inst-loc str "/" (uri/escape-token (str token))))
+  (if (:quiet? ctx)
+    ctx
+    (update ctx :inst-path conj token)))
 
-(defn- err [ctx message]
+(defn- err* [ctx message]
   {:valid? false
    :props #{}
    :items #{}
-   :errors [(cond-> {:instanceLocation (:inst-loc ctx)
-                     :keywordLocation (:kw-loc ctx)
+   :errors [(cond-> {:instanceLocation (pointer nil (:inst-path ctx))
+                     :keywordLocation (pointer nil (:kw-path ctx))
                      :error message}
               (not (str/blank? (:base ctx)))
-              (assoc :absoluteKeywordLocation (str (:base ctx) "#" (:res-loc ctx))))]})
+              (assoc :absoluteKeywordLocation
+                     (str (:base ctx) "#" (pointer (:res-prefix ctx) (:res-path ctx)))))]})
+
+(defmacro ^:private err
+  "One error at the context's current location. A MACRO because the message is
+   always a `str` of the instance, the bound and the keyword that refused it: a
+   fail-fast run must not build the string it is about to discard."
+  [ctx message]
+  `(let [c# ~ctx]
+     (if (:quiet? c#) nope (err* c# ~message))))
+
+(defmacro ^:private and-merge
+  "Merge the next result into `res`, unless a fail-fast run already knows the
+   verdict. An invalid node stays invalid however much more is evaluated under
+   it, so `valid?` stops there; `validate` goes on and collects every error."
+  [quiet? res & body]
+  `(let [r# ~res]
+     (if (and ~quiet? (not (:valid? r#)))
+       r#
+       (merge-res r# (do ~@body)))))
 
 (defn- enter
   "Follow a reference into `target`: the base moves, the pointer inside the
@@ -264,21 +474,42 @@
    `$dynamicRef` searches from the outermost entry inward."
   [ctx target]
   (let [base (:base target)]
-    (cond-> (assoc ctx :res-loc (or (:ptr target) "") :id-resolved true)
+    (cond-> (assoc ctx :res-prefix (or (:ptr target) "") :res-path [] :id-resolved true)
       (not= base (:base ctx))
       (-> (assoc :base base)
           (update :dyn-scope (fnil conj []) base)))))
 
 ;; In-place applicators
 
+(defn- deeper
+  "One step further along a chain of references, refusing the chain that never
+   ends. Only a reference can recur forever - every other applicator descends
+   into an instance that is strictly smaller - so this is the one place the
+   bound has to be paid for."
+  [ctx]
+  (let [depth (inc (long (:depth ctx 0)))]
+    (when (> depth max-eval-depth)
+      (throw (ex-info "schema recursion did not terminate"
+                      {:skjema/error :schema/recursion
+                       :keywordLocation (pointer nil (:kw-path ctx))})))
+    (assoc ctx :depth depth)))
+
 (defn- eval-ref [f ctx schema instance]
   (let [ref (get schema "$ref")
-        uri (uri/resolve-ref (:base ctx) ref)
-        target (lookup ctx uri)]
-    (when-not target
-      (throw (ex-info (str "cannot resolve $ref " (pr-str ref))
-                      {:skjema/error :schema/unresolved-ref :ref ref :base (:base ctx) :uri uri})))
-    (f (-> ctx (update :kw-loc str "/$ref") (enter target)) (:schema target) instance)))
+        base (:base ctx)
+        cache (:ref-cache ctx)
+        ;; The same handful of references is resolved on every validation of
+        ;; every instance, and resolution is string work: cache it per compiled
+        ;; schema, keyed by the base it was resolved against.
+        target (or (get @cache [base ref])
+                   (let [uri (uri/resolve-ref base ref)
+                         t (lookup ctx uri)]
+                     (when-not t
+                       (throw (ex-info (str "cannot resolve $ref " (pr-str ref))
+                                       {:skjema/error :schema/unresolved-ref :ref ref :base base :uri uri})))
+                     (swap! cache assoc [base ref] t)
+                     t))]
+    (f (-> ctx deeper (update :kw-path conj "$ref") (enter target)) (:schema target) instance)))
 
 (defn- eval-dynamic-ref
   "`$dynamicRef` resolves like `$ref` UNLESS the schema it lands on carries a
@@ -299,12 +530,14 @@
     (when-not target
       (throw (ex-info (str "cannot resolve $dynamicRef " (pr-str ref))
                       {:skjema/error :schema/unresolved-ref :ref ref :base (:base ctx) :uri uri})))
-    (f (-> ctx (update :kw-loc str "/$dynamicRef") (enter target)) (:schema target) instance)))
+    (f (-> ctx deeper (update :kw-path conj "$dynamicRef") (enter target)) (:schema target) instance)))
 
 (defn- eval-all-of [f ctx schema instance]
-  (reduce merge-res ok
-          (map-indexed (fn [i sub] (f (at-keyword ctx "allOf" i) sub instance))
-                       (get schema "allOf"))))
+  (loop [i 0 subs (seq (get schema "allOf")) res ok]
+    (if (or (nil? subs) (and (:quiet? ctx) (not (:valid? res))))
+      res
+      (recur (inc i) (next subs)
+             (merge-res res (f (at-keyword ctx "allOf" i) (first subs) instance))))))
 
 (defn- eval-any-of [f ctx schema instance]
   (let [rs (map-indexed (fn [i sub] (f (at-keyword ctx "anyOf" i) sub instance))
@@ -348,10 +581,12 @@
 (defn- eval-dependent-schemas [f ctx schema instance]
   (if-not (map? instance)
     ok
-    (reduce merge-res ok
-            (for [[k sub] (get schema "dependentSchemas")
-                  :when (contains? instance k)]
-              (f (at-keyword ctx "dependentSchemas" k) sub instance)))))
+    (reduce-kv (fn [res k sub]
+                 (if (contains? instance k)
+                   (and-merge (:quiet? ctx) res (f (at-keyword ctx "dependentSchemas" k) sub instance))
+                   res))
+               ok
+               (get schema "dependentSchemas"))))
 
 (defn- eval-dependencies
   "The `dependencies` of draft-07, which 2020-12 split in two: an array of
@@ -362,17 +597,21 @@
   [f ctx schema instance]
   (if-not (map? instance)
     ok
-    (reduce merge-res ok
-            (for [[k v] (get schema "dependencies")
-                  :when (contains? instance k)]
-              (if (sequential? v)
-                (let [missing (remove #(contains? instance %) v)]
-                  (if (seq missing)
-                    (err (at-keyword ctx "dependencies" k)
-                         (str "property " (pr-str k) " requires "
-                              (str/join ", " (map pr-str missing))))
-                    ok))
-                (f (at-keyword ctx "dependencies" k) v instance))))))
+    (reduce-kv
+      (fn [res k v]
+        (if-not (contains? instance k)
+          res
+          (and-merge (:quiet? ctx) res
+            (if (sequential? v)
+              (let [missing (remove #(contains? instance %) v)]
+                (if (seq missing)
+                  (err (at-keyword ctx "dependencies" k)
+                       (str "property " (pr-str k) " requires "
+                            (str/join ", " (map pr-str missing))))
+                  ok))
+              (f (at-keyword ctx "dependencies" k) v instance)))))
+      ok
+      (get schema "dependencies"))))
 
 (defn- eval-format
   "`format` as an ASSERTION, which happens only where the format-assertion
@@ -386,95 +625,135 @@
 
 ;; Child applicators
 
+(def ^:private absent
+  "What `get` answers for a keyword the schema does not carry, so presence costs
+   one lookup instead of a `contains?` beside it."
+  (Object.))
+
 (defn- eval-object-applicators
   "`properties`, `patternProperties` and `additionalProperties` together,
    because `additionalProperties` is defined as 'whatever the other two did not
-   match' - and only its ADJACENT siblings count, never what a `$ref` matched."
+   match' - and only its ADJACENT siblings count, never what a `$ref` matched.
+   One pass over the instance decides all three for each member."
   [f ctx schema instance]
-  (if-not (map? instance)
-    ok
-    (let [props (get schema "properties")
-          patterns (get schema "patternProperties")
-          ks (keys instance)
-          named (when (map? props) (filter #(contains? props %) ks))
-          matched-pattern (when (map? patterns)
-                            (for [k ks [p _] patterns :when (re-find (regex/pattern-of p) k)] k))
-          matched (set (concat named matched-pattern))
-          additional? (contains? schema "additionalProperties")
-          extra (when additional? (remove matched ks))
-          rs (concat
-               (for [k named]
-                 (child-res (f (-> ctx (at-keyword "properties" k) (at-instance k))
-                               (get props k)
-                               (get instance k))))
-               (for [k ks [p sub] patterns :when (re-find (regex/pattern-of p) k)]
-                 (child-res (f (-> ctx (at-keyword "patternProperties" p) (at-instance k))
-                               sub
-                               (get instance k))))
-               (for [k extra]
-                 (child-res (f (-> ctx (at-keyword "additionalProperties") (at-instance k))
-                               (get schema "additionalProperties")
-                               (get instance k)))))]
-      (assoc (reduce merge-res ok rs) :props (into matched extra)))))
+  (let [props (get schema "properties")
+        patterns (get schema "patternProperties")
+        additional (get schema "additionalProperties" absent)
+        props? (map? props)
+        patterns? (and (map? patterns) (seq patterns))
+        additional? (not (identical? absent additional))]
+    (if-not (and (map? instance) (or props? patterns? additional?))
+      ok
+      (let [annotate? (:annotate? ctx)
+            quiet? (:quiet? ctx)]
+        (loop [ks (seq (keys instance))
+               res ok
+               covered (when annotate? (transient #{}))]
+          (cond
+            (and quiet? (not (:valid? res))) res
+            (nil? ks) (if annotate? (assoc res :props (persistent! covered)) res)
+            :else
+            (let [k (first ks)
+                  v (get instance k)
+                  named? (and props? (contains? props k))
+                  res (if named?
+                        (merge-res res (child-res (f (-> ctx (at-keyword "properties" k) (at-instance k))
+                                                     (get props k)
+                                                     v)))
+                        res)
+                  matched (when patterns?
+                            (reduce-kv (fn [acc p sub]
+                                         (if (re-find (regex/pattern-of p) k)
+                                           (conj acc [p sub])
+                                           acc))
+                                       []
+                                       patterns))
+                  res (reduce (fn [res [p sub]]
+                                (merge-res res (child-res (f (-> ctx (at-keyword "patternProperties" p) (at-instance k))
+                                                             sub
+                                                             v))))
+                              res
+                              matched)
+                  covered? (or named? (seq matched))
+                  res (if (and additional? (not covered?))
+                        (merge-res res (child-res (f (-> ctx (at-keyword "additionalProperties") (at-instance k))
+                                                     additional
+                                                     v)))
+                        res)]
+              (recur (next ks)
+                     res
+                     (if (and annotate? (or covered? additional?)) (conj! covered k) covered)))))))))
 
 (defn- eval-property-names [f ctx schema instance]
-  (if-not (and (contains? schema "propertyNames") (map? instance))
-    ok
-    (reduce merge-res ok
-            (for [k (keys instance)]
-              (child-res (f (-> ctx (at-keyword "propertyNames") (at-instance k))
-                            (get schema "propertyNames")
-                            k))))))
+  (let [sub (get schema "propertyNames" absent)]
+    (if-not (and (map? instance) (not (identical? absent sub)))
+      ok
+      (loop [ks (seq (keys instance)) res ok]
+        (if (or (nil? ks) (and (:quiet? ctx) (not (:valid? res))))
+          res
+          (recur (next ks)
+                 (merge-res res (child-res (f (-> ctx (at-keyword "propertyNames") (at-instance (first ks)))
+                                              sub
+                                              (first ks))))))))))
 
 (defn- eval-array-applicators
   "`prefixItems` covers the first N positions, `items` covers everything after
-   them. The indices they touched are what `unevaluatedItems` later subtracts."
+   them. The indices they touched are what `unevaluatedItems` later subtracts -
+   and that set is only built when the document has an `unevaluated*` to spend
+   it on."
   [f ctx schema instance]
-  (if-not (sequential? instance)
-    ok
-    (let [prefix (get schema "prefixItems")
-          n (count instance)
-          pre-n (if (sequential? prefix) (min (count prefix) n) 0)
-          items? (contains? schema "items")
-          rs (concat
-               (for [i (range pre-n)]
-                 (child-res (f (-> ctx (at-keyword "prefixItems" i) (at-instance i))
-                               (nth prefix i)
-                               (nth instance i))))
-               (when items?
-                 (for [i (range pre-n n)]
-                   (child-res (f (-> ctx (at-keyword "items") (at-instance i))
-                                 (get schema "items")
-                                 (nth instance i))))))]
-      (assoc (reduce merge-res ok rs)
-             :items (into (set (range pre-n)) (when items? (range pre-n n)))))))
+  (let [prefix (get schema "prefixItems")
+        items (get schema "items" absent)
+        items? (not (identical? absent items))
+        prefix? (sequential? prefix)]
+    (if-not (and (sequential? instance) (or prefix? items?))
+      ok
+      (let [n (count instance)
+            pre-n (if prefix? (min (count prefix) n) 0)
+            end (if items? n pre-n)
+            quiet? (:quiet? ctx)]
+        (loop [i 0 res ok]
+          (cond
+            (and quiet? (not (:valid? res))) res
+            (>= i end) (if (:annotate? ctx)
+                         (assoc res :items (into #{} (range end)))
+                         res)
+            :else
+            (let [r (if (< i pre-n)
+                      (f (-> ctx (at-keyword "prefixItems" i) (at-instance i)) (nth prefix i) (nth instance i))
+                      (f (-> ctx (at-keyword "items") (at-instance i)) items (nth instance i)))]
+              (recur (inc i) (merge-res res (child-res r))))))))))
 
 (defn- eval-contains
   "`contains` is the one child applicator whose ANNOTATION is the interesting
    part: the indices that matched are evaluated, which is what keeps
    `unevaluatedItems` from rejecting them."
   [ctx-count-only f ctx schema instance]
-  (if-not (and (contains? schema "contains") (sequential? instance))
-    ok
-    (let [sub (get schema "contains")
-          matched (set (for [i (range (count instance))
-                             :when (:valid? (f (-> ctx (at-keyword "contains") (at-instance i))
-                                               sub
-                                               (nth instance i)))]
-                         i))
-          hits (count matched)
-          minc (get schema "minContains")
-          maxc (get schema "maxContains")
-          minc (if (and ctx-count-only (number? minc)) (long minc) 1)
-          maxc (when (and ctx-count-only (number? maxc)) (long maxc))
-          low (when (< hits minc)
-                (err (at-keyword ctx "contains")
-                     (str "only " hits " of " (count instance)
-                          " items match contains, at least " minc " must")))
-          high (when (and maxc (> hits maxc))
-                 (err (at-keyword ctx "maxContains")
-                      (str hits " items match contains, at most " maxc " may")))]
-      (assoc (reduce merge-res ok (remove nil? [low high])) :items matched))))
+  (let [sub (get schema "contains" absent)]
+    (if-not (and (sequential? instance) (not (identical? absent sub)))
+      ok
+      (let [annotate? (:annotate? ctx)
+            n (count instance)
+            matched (loop [i 0 acc (when annotate? (transient #{})) hits 0]
+                      (if (>= i n)
+                        [(when annotate? (persistent! acc)) hits]
+                        (if (:valid? (f (-> ctx (at-keyword "contains") (at-instance i)) sub (nth instance i)))
+                          (recur (inc i) (if annotate? (conj! acc i) acc) (inc hits))
+                          (recur (inc i) acc hits))))
+            hits (long (second matched))
+            minc (get schema "minContains")
+            maxc (get schema "maxContains")
+            minc (if (and ctx-count-only (number? minc)) (long minc) 1)
+            maxc (when (and ctx-count-only (number? maxc)) (long maxc))
+            low (when (< hits minc)
+                  (err (at-keyword ctx "contains")
+                       (str "only " hits " of " n
+                            " items match contains, at least " minc " must")))
+            high (when (and maxc (> hits maxc))
+                   (err (at-keyword ctx "maxContains")
+                        (str hits " items match contains, at most " maxc " may")))
+            res (reduce merge-res ok (remove nil? [low high]))]
+        (if annotate? (assoc res :items (first matched)) res)))))
 
 (defn- eval-unevaluated-properties [f ctx schema instance evaluated]
   (if-not (and (contains? schema "unevaluatedProperties") (map? instance))
@@ -498,110 +777,140 @@
 
 ;; Assertions (the validation vocabulary)
 
-(defn- eval-assertions [ctx schema instance]
-  (let [checks
-        [(when-let [t (get schema "type")]
-           (let [types (if (sequential? t) t [t])]
-             (when-not (some #(type-match? % instance) types)
-               (err (at-keyword ctx "type")
-                    (str "expected " (str/join " or " types) ", got " (json-type instance))))))
+(defn- assert-numbers [km ctx schema instance res]
+  (let [divisor (when (has? km m-multiple-of) (get schema "multipleOf"))
+        maximum (when (has? km m-maximum) (get schema "maximum"))
+        exclusive-max (when (has? km m-exclusive-maximum) (get schema "exclusiveMaximum"))
+        minimum (when (has? km m-minimum) (get schema "minimum"))
+        exclusive-min (when (has? km m-exclusive-minimum) (get schema "exclusiveMinimum"))
+        res (if (and (number? divisor) (not (multiple-of? instance divisor)))
+              (merge-res res (err (at-keyword ctx "multipleOf")
+                                  (str instance " is not a multiple of " divisor)))
+              res)
+        res (if (and (number? maximum) (pos? (num-compare instance maximum)))
+              (merge-res res (err (at-keyword ctx "maximum")
+                                  (str instance " is greater than the maximum " maximum)))
+              res)
+        res (if (and (number? exclusive-max) (not (neg? (num-compare instance exclusive-max))))
+              (merge-res res (err (at-keyword ctx "exclusiveMaximum")
+                                  (str instance " is not below the exclusive maximum " exclusive-max)))
+              res)
+        res (if (and (number? minimum) (neg? (num-compare instance minimum)))
+              (merge-res res (err (at-keyword ctx "minimum")
+                                  (str instance " is less than the minimum " minimum)))
+              res)]
+    (if (and (number? exclusive-min) (not (pos? (num-compare instance exclusive-min))))
+      (merge-res res (err (at-keyword ctx "exclusiveMinimum")
+                          (str instance " is not above the exclusive minimum " exclusive-min)))
+      res)))
 
-         (when (contains? schema "enum")
-           (when-not (some #(json-equal? % instance) (get schema "enum"))
-             (err (at-keyword ctx "enum") "the instance is not one of the enumerated values")))
+(defn- assert-strings [km ctx schema instance res]
+  (let [max-length (when (has? km m-max-length) (get schema "maxLength"))
+        min-length (when (has? km m-min-length) (get schema "minLength"))
+        pattern (when (has? km m-pattern) (get schema "pattern"))
+        length (when (or (number? max-length) (number? min-length))
+                 (code-point-count instance))
+        res (if (and (number? max-length) (> (long length) (long max-length)))
+              (merge-res res (err (at-keyword ctx "maxLength")
+                                  (str "the string is " length
+                                       " characters long, the maximum is " max-length)))
+              res)
+        res (if (and (number? min-length) (< (long length) (long min-length)))
+              (merge-res res (err (at-keyword ctx "minLength")
+                                  (str "the string is " length
+                                       " characters long, the minimum is " min-length)))
+              res)]
+    (if (and (string? pattern) (not (re-find (regex/pattern-of pattern) instance)))
+      (merge-res res (err (at-keyword ctx "pattern")
+                          (str "the string does not match the pattern " (pr-str pattern))))
+      res)))
 
-         (when (contains? schema "const")
-           (when-not (json-equal? (get schema "const") instance)
-             (err (at-keyword ctx "const")
-                  (str "the instance is not the constant " (json/write-str (get schema "const"))))))
+(defn- assert-arrays [km ctx schema instance res]
+  (let [max-items (when (has? km m-max-items) (get schema "maxItems"))
+        min-items (when (has? km m-min-items) (get schema "minItems"))
+        unique? (and (has? km m-unique-items) (true? (get schema "uniqueItems")))
+        n (when (or (number? max-items) (number? min-items)) (count instance))
+        res (if (and (number? max-items) (> (long n) (long max-items)))
+              (merge-res res (err (at-keyword ctx "maxItems")
+                                  (str "the array has " n " items, the maximum is " max-items)))
+              res)
+        res (if (and (number? min-items) (< (long n) (long min-items)))
+              (merge-res res (err (at-keyword ctx "minItems")
+                                  (str "the array has " n " items, the minimum is " min-items)))
+              res)]
+    (if unique?
+      (let [canon (mapv canonical instance)]
+        (if (= (count canon) (count (set canon)))
+          res
+          (merge-res res (err (at-keyword ctx "uniqueItems") "the array has duplicate items"))))
+      res)))
 
-         (when (and (number? instance) (number? (get schema "multipleOf")))
-           (when-not (multiple-of? instance (get schema "multipleOf"))
-             (err (at-keyword ctx "multipleOf")
-                  (str instance " is not a multiple of " (get schema "multipleOf")))))
+(defn- assert-objects [km ctx schema instance res]
+  (let [max-props (when (has? km m-max-properties) (get schema "maxProperties"))
+        min-props (when (has? km m-min-properties) (get schema "minProperties"))
+        required (when (has? km m-required) (get schema "required"))
+        dependent (when (has? km m-dependent-required) (get schema "dependentRequired"))
+        n (when (or (number? max-props) (number? min-props)) (count instance))
+        res (if (and (number? max-props) (> (long n) (long max-props)))
+              (merge-res res (err (at-keyword ctx "maxProperties")
+                                  (str "the object has " n " properties, the maximum is " max-props)))
+              res)
+        res (if (and (number? min-props) (< (long n) (long min-props)))
+              (merge-res res (err (at-keyword ctx "minProperties")
+                                  (str "the object has " n " properties, the minimum is " min-props)))
+              res)
+        res (if (sequential? required)
+              (let [missing (remove #(contains? instance %) required)]
+                (if (seq missing)
+                  (merge-res res (err (at-keyword ctx "required")
+                                      (str "missing required " (if (next missing) "properties " "property ")
+                                           (str/join ", " (map pr-str missing)))))
+                  res))
+              res)]
+    (if (map? dependent)
+      (let [missing (for [[k required] dependent
+                          :when (contains? instance k)
+                          r required
+                          :when (not (contains? instance r))]
+                      [k r])]
+        (if (seq missing)
+          (merge-res res (err (at-keyword ctx "dependentRequired")
+                              (str/join ", " (for [[k r] missing]
+                                               (str "property " (pr-str k) " requires " (pr-str r))))))
+          res))
+      res)))
 
-         (when (and (number? instance) (number? (get schema "maximum")))
-           (when (pos? (num-compare instance (get schema "maximum")))
-             (err (at-keyword ctx "maximum")
-                  (str instance " is greater than the maximum " (get schema "maximum")))))
-
-         (when (and (number? instance) (number? (get schema "exclusiveMaximum")))
-           (when-not (neg? (num-compare instance (get schema "exclusiveMaximum")))
-             (err (at-keyword ctx "exclusiveMaximum")
-                  (str instance " is not below the exclusive maximum " (get schema "exclusiveMaximum")))))
-
-         (when (and (number? instance) (number? (get schema "minimum")))
-           (when (neg? (num-compare instance (get schema "minimum")))
-             (err (at-keyword ctx "minimum")
-                  (str instance " is less than the minimum " (get schema "minimum")))))
-
-         (when (and (number? instance) (number? (get schema "exclusiveMinimum")))
-           (when-not (pos? (num-compare instance (get schema "exclusiveMinimum")))
-             (err (at-keyword ctx "exclusiveMinimum")
-                  (str instance " is not above the exclusive minimum " (get schema "exclusiveMinimum")))))
-
-         (when (and (string? instance) (number? (get schema "maxLength")))
-           (when (> (code-point-count instance) (long (get schema "maxLength")))
-             (err (at-keyword ctx "maxLength")
-                  (str "the string is " (code-point-count instance)
-                       " characters long, the maximum is " (get schema "maxLength")))))
-
-         (when (and (string? instance) (number? (get schema "minLength")))
-           (when (< (code-point-count instance) (long (get schema "minLength")))
-             (err (at-keyword ctx "minLength")
-                  (str "the string is " (code-point-count instance)
-                       " characters long, the minimum is " (get schema "minLength")))))
-
-         (when (and (string? instance) (string? (get schema "pattern")))
-            (when-not (re-find (regex/pattern-of (get schema "pattern")) instance)
-             (err (at-keyword ctx "pattern")
-                  (str "the string does not match the pattern " (pr-str (get schema "pattern"))))))
-
-         (when (and (sequential? instance) (number? (get schema "maxItems")))
-           (when (> (count instance) (long (get schema "maxItems")))
-             (err (at-keyword ctx "maxItems")
-                  (str "the array has " (count instance) " items, the maximum is " (get schema "maxItems")))))
-
-         (when (and (sequential? instance) (number? (get schema "minItems")))
-           (when (< (count instance) (long (get schema "minItems")))
-             (err (at-keyword ctx "minItems")
-                  (str "the array has " (count instance) " items, the minimum is " (get schema "minItems")))))
-
-         (when (and (sequential? instance) (true? (get schema "uniqueItems")))
-           (let [canon (mapv canonical instance)]
-             (when-not (= (count canon) (count (set canon)))
-               (err (at-keyword ctx "uniqueItems") "the array has duplicate items"))))
-
-         (when (and (map? instance) (number? (get schema "maxProperties")))
-           (when (> (count instance) (long (get schema "maxProperties")))
-             (err (at-keyword ctx "maxProperties")
-                  (str "the object has " (count instance) " properties, the maximum is "
-                       (get schema "maxProperties")))))
-
-         (when (and (map? instance) (number? (get schema "minProperties")))
-           (when (< (count instance) (long (get schema "minProperties")))
-             (err (at-keyword ctx "minProperties")
-                  (str "the object has " (count instance) " properties, the minimum is "
-                       (get schema "minProperties")))))
-
-         (when (and (map? instance) (sequential? (get schema "required")))
-           (let [missing (remove #(contains? instance %) (get schema "required"))]
-             (when (seq missing)
-               (err (at-keyword ctx "required")
-                    (str "missing required " (if (next missing) "properties " "property ")
-                         (str/join ", " (map pr-str missing)))))))
-
-         (when (and (map? instance) (map? (get schema "dependentRequired")))
-           (let [missing (for [[k required] (get schema "dependentRequired")
-                               :when (contains? instance k)
-                               r required
-                               :when (not (contains? instance r))]
-                           [k r])]
-             (when (seq missing)
-               (err (at-keyword ctx "dependentRequired")
-                    (str/join ", " (for [[k r] missing]
-                                     (str "property " (pr-str k) " requires " (pr-str r))))))))]]
-    (reduce merge-res ok (remove nil? checks))))
+(defn- eval-assertions
+  "The validation vocabulary, grouped by the JSON type each keyword can speak
+   about: a string instance never asks what `minimum` says, and a node whose
+   mask carries no assertion of that group never looks one up."
+  [^long km ctx schema instance]
+  (let [res (if (has? km m-type)
+              (let [t (get schema "type")
+                    types (if (sequential? t) t [t])]
+                (if (some #(type-match? % instance) types)
+                  ok
+                  (err (at-keyword ctx "type")
+                       (str "expected " (str/join " or " types) ", got " (json-type instance)))))
+              ok)
+        res (if (and (has? km m-enum)
+                     (not (some #(json-equal? % instance) (get schema "enum"))))
+              (merge-res res (err (at-keyword ctx "enum")
+                                  "the instance is not one of the enumerated values"))
+              res)
+        res (if (has? km m-const)
+              (let [const (get schema "const")]
+                (if (json-equal? const instance)
+                  res
+                  (merge-res res (err (at-keyword ctx "const")
+                                      (str "the instance is not the constant " (json/write-str const))))))
+              res)]
+    (cond
+      (number? instance) (if (has? km m-numbers) (assert-numbers km ctx schema instance res) res)
+      (string? instance) (if (has? km m-strings) (assert-strings km ctx schema instance res) res)
+      (map? instance) (if (has? km m-objects) (assert-objects km ctx schema instance res) res)
+      (sequential? instance) (if (has? km m-arrays) (assert-arrays km ctx schema instance res) res)
+      :else res)))
 
 ;; The evaluator
 
@@ -696,55 +1005,113 @@
     (false? schema) (err ctx "the false schema rejects every instance")
 
     (map? schema)
-    (let [depth (inc (long (:depth ctx 0)))
-          _ (when (> depth max-eval-depth)
-              (throw (ex-info "schema recursion did not terminate"
-                              {:skjema/error :schema/recursion :keywordLocation (:kw-loc ctx)})))
-          id (get schema "$id")
-          ctx (assoc ctx :depth depth)
+    (let [km (mask schema)
           ;; A resource reached through a reference is ALREADY at its canonical
           ;; base: resolving its own `$id` a second time would append the
           ;; relative identifier to itself (`nested/nested/foo.json`).
           ctx (if (:id-resolved ctx)
-                (dissoc ctx :id-resolved)
-                (cond-> ctx
-                  (string? id)
-                  (as-> c (let [b (uri/strip-fragment (uri/resolve-ref (:base c) id))]
-                            (-> c
-                                (assoc :base b :res-loc "")
-                                (update :dyn-scope (fnil conj []) b))))))
-          ctx (if-let [ms (get schema "$schema")]
+                (assoc ctx :id-resolved false)
+                (let [id (when (has? km m-id) (get schema "$id"))]
+                  (if (string? id)
+                    (let [b (uri/strip-fragment (uri/resolve-ref (:base ctx) id))]
+                      (-> ctx
+                          (assoc :base b :res-prefix "" :res-path [])
+                          (update :dyn-scope (fnil conj []) b)))
+                    ctx)))
+          ctx (if-let [ms (when (has? km m-dialect) (get schema "$schema"))]
                 (assoc ctx
                        :validation? (vocabulary-validation? ctx ms)
                        :format? (or (:format-assertion? ctx) (vocabulary-format? ctx ms))
                        :dialect (dialects (uri/strip-fragment ms)))
                 ctx)
-          schema (if-let [keywords (:dialect ctx)] (dialect-view keywords schema) schema)
-          parts (cond-> []
-                  (string? (get schema "$ref")) (conj (eval-ref eval-schema ctx schema instance))
-                  (string? (get schema "$dynamicRef")) (conj (eval-dynamic-ref eval-schema ctx schema instance))
-                  (sequential? (get schema "allOf")) (conj (eval-all-of eval-schema ctx schema instance))
-                  (sequential? (get schema "anyOf")) (conj (eval-any-of eval-schema ctx schema instance))
-                  (sequential? (get schema "oneOf")) (conj (eval-one-of eval-schema ctx schema instance))
-                  (contains? schema "not") (conj (eval-not eval-schema ctx schema instance))
-                  (contains? schema "if") (conj (eval-conditional eval-schema ctx schema instance))
-                  (map? (get schema "dependentSchemas")) (conj (eval-dependent-schemas eval-schema ctx schema instance))
-                  (map? (get schema "dependencies")) (conj (eval-dependencies eval-schema ctx schema instance))
-                  true (conj (eval-object-applicators eval-schema ctx schema instance))
-                  true (conj (eval-property-names eval-schema ctx schema instance))
-                  true (conj (eval-array-applicators eval-schema ctx schema instance))
-                  true (conj (eval-contains (:validation? ctx true) eval-schema ctx schema instance))
-                  (:validation? ctx true) (conj (eval-assertions ctx schema instance))
-                  (and (:format? ctx) (string? (get schema "format")))
-                  (conj (eval-format ctx schema instance)))
-          merged (reduce merge-res ok parts)
-          merged (merge-res merged (eval-unevaluated-properties eval-schema ctx schema instance (:props merged)))]
-      (merge-res merged (eval-unevaluated-items eval-schema ctx schema instance (:items merged))))
+          ;; A legacy dialect is read through a view of the node, which the
+          ;; compiler never saw and whose mask is therefore read here.
+          view (if-let [keywords (:dialect ctx)] (dialect-view keywords schema) schema)
+          km (if (identical? view schema) km (compute-mask view))
+          schema view
+          quiet? (:quiet? ctx)
+          validation? (:validation? ctx true)
+          ;; Every applicator the schema does NOT carry costs one bit test and
+          ;; nothing else, and a fail-fast run stops at the first one that
+          ;; refuses: `and-merge` is where both of those happen.
+          res (if (and (has? km m-ref) (string? (get schema "$ref")))
+                (and-merge quiet? ok (eval-ref eval-schema ctx schema instance))
+                ok)
+          res (if (and (has? km m-dynamic-ref) (string? (get schema "$dynamicRef")))
+                (and-merge quiet? res (eval-dynamic-ref eval-schema ctx schema instance))
+                res)
+          res (if (and (has? km m-all-of) (sequential? (get schema "allOf")))
+                (and-merge quiet? res (eval-all-of eval-schema ctx schema instance))
+                res)
+          res (if (and (has? km m-any-of) (sequential? (get schema "anyOf")))
+                (and-merge quiet? res (eval-any-of eval-schema ctx schema instance))
+                res)
+          res (if (and (has? km m-one-of) (sequential? (get schema "oneOf")))
+                (and-merge quiet? res (eval-one-of eval-schema ctx schema instance))
+                res)
+          res (if (has? km m-not)
+                (and-merge quiet? res (eval-not eval-schema ctx schema instance))
+                res)
+          res (if (has? km m-if)
+                (and-merge quiet? res (eval-conditional eval-schema ctx schema instance))
+                res)
+          res (if (and (has? km m-dependent-schemas) (map? (get schema "dependentSchemas")))
+                (and-merge quiet? res (eval-dependent-schemas eval-schema ctx schema instance))
+                res)
+          res (if (and (has? km m-dependencies) (map? (get schema "dependencies")))
+                (and-merge quiet? res (eval-dependencies eval-schema ctx schema instance))
+                res)
+          object? (map? instance)
+          array? (sequential? instance)
+          res (if (and object? (has? km m-object))
+                (and-merge quiet? res (eval-object-applicators eval-schema ctx schema instance))
+                res)
+          res (if (and object? (has? km m-property-names))
+                (and-merge quiet? res (eval-property-names eval-schema ctx schema instance))
+                res)
+          res (if (and array? (has? km m-array))
+                (and-merge quiet? res (eval-array-applicators eval-schema ctx schema instance))
+                res)
+          res (if (and array? (has? km m-contains))
+                (and-merge quiet? res (eval-contains validation? eval-schema ctx schema instance))
+                res)
+          res (if (and validation? (has? km m-assertions))
+                (and-merge quiet? res (eval-assertions km ctx schema instance))
+                res)
+          res (if (and (has? km m-format) (:format? ctx) (string? (get schema "format")))
+                (and-merge quiet? res (eval-format ctx schema instance))
+                res)
+          res (if (and object? (has? km m-unevaluated-props))
+                (and-merge quiet? res (eval-unevaluated-properties eval-schema ctx schema instance (:props res)))
+                res)]
+      (if (and array? (has? km m-unevaluated-items))
+        (and-merge quiet? res (eval-unevaluated-items eval-schema ctx schema instance (:items res)))
+        res))
 
     :else (throw (ex-info "a JSON Schema must be an object or a boolean"
                           {:skjema/error :schema/invalid :value schema}))))
 
 ;; Public entry points
+
+(defn- eval-ctx
+  "The evaluation context a compiled schema is validated with. It depends on
+   the SCHEMA and not on the instance, so it is built once, at compile time,
+   and every validation starts from the same value."
+  [c quiet?]
+  (->Ctx (:index c)
+         (:dynamic c)
+         (:ref-cache c)
+         (:base c)
+         [(:base c)]
+         true
+         (:format-assertion c)
+         (:format-assertion c)
+         (:annotate? c)
+         quiet?
+         false
+         [] [] "" []
+         0
+         nil))
 
 (defn compile
   "Index a schema once so every `$ref`, `$anchor` and `$dynamicAnchor` in it is
@@ -769,18 +1136,29 @@
                               (index-schema doc uri "")))
                         {:index {} :dynamic {}}
                         registry)
+         schema (with-masks schema)
          acc (index-schema acc schema base "")
          root-base (if (and (map? schema) (string? (get schema "$id")))
                      (uri/strip-fragment (uri/resolve-ref base (get schema "$id")))
                      base)
          acc (update acc :index #(assoc % base {:schema schema :base root-base :ptr ""}
                                           root-base {:schema schema :base root-base :ptr ""}))]
-     {:skjema/compiled true
-      :schema schema
-      :base root-base
-      :index (:index acc)
-       :dynamic (:dynamic acc)
-       :format-assertion (boolean (:format-assertion opts))})))
+     (let [c {:skjema/compiled true
+              :schema schema
+              :base root-base
+              :index (:index acc)
+              :dynamic (:dynamic acc)
+              ;; Annotations exist for `unevaluatedProperties` and
+              ;; `unevaluatedItems`. A document that never mentions them has
+              ;; nothing to spend a set of evaluated member names on, so none
+              ;; is built.
+              :annotate? (boolean (:unevaluated? acc))
+              ;; `$ref` resolution is string work against a fixed index: the
+              ;; same handful of answers, once per compiled schema instead of
+              ;; once per instance.
+              :ref-cache (atom {})
+              :format-assertion (boolean (:format-assertion opts))}]
+       (assoc c :ctx (eval-ctx c false) :quiet-ctx (eval-ctx c true))))))
 
 (defn compiled? [x] (boolean (:skjema/compiled x)))
 
@@ -793,23 +1171,16 @@
   ([schema instance] (validate schema instance nil))
   ([schema instance opts]
    (let [c (if (compiled? schema) schema (compile schema opts))
-         ctx {:index (:index c)
-              :dynamic (:dynamic c)
-              :base (:base c)
-              :dyn-scope [(:base c)]
-               :validation? true
-               :format-assertion? (:format-assertion c)
-               :format? (:format-assertion c)
-              :inst-loc ""
-              :kw-loc ""
-              :res-loc ""
-              :depth 0}
-         r (eval-schema ctx (:schema c) instance)]
+         r (eval-schema (:ctx c) (:schema c) instance)]
      (if (:valid? r)
        {:valid true}
        {:valid false :errors (vec (:errors r))}))))
 
 (defn valid?
-  "True when the instance validates. Use `validate` when the reason matters."
+  "True when the instance validates. Use `validate` when the reason matters -
+   this asks for the verdict alone, so evaluation stops at the first keyword
+   that refuses and no error is built on the way."
   ([schema instance] (valid? schema instance nil))
-  ([schema instance opts] (:valid (validate schema instance opts))))
+  ([schema instance opts]
+   (let [c (if (compiled? schema) schema (compile schema opts))]
+     (true? (:valid? (eval-schema (:quiet-ctx c) (:schema c) instance))))))
