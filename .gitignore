@@ -1,5 +1,8 @@
 /target/
 /.cpcache/
+**/.cpcache/
+/classes/
+*.class
 /.lsp/
 /.clj-kondo/.cache/
 /.calva/
