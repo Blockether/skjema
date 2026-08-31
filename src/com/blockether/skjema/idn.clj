@@ -349,11 +349,24 @@
 
 (def ^:private separators #{0x002E 0x3002 0xFF0E 0xFF61})
 
+(defn- ascii?
+  "Whether every character is ASCII, which is what decides whether the mapping
+   step has anything to do at all."
+  [^String s]
+  (let [n (.length s)]
+    (loop [i 0]
+      (or (>= i n)
+          (and (< (int (.charAt s i)) 128) (recur (inc i)))))))
+
 (defn- map-string
   "The UTS 46 mapping step: drop what a domain name ignores, fold the
-   compatibility forms, lower-case, compose."
+   compatibility forms, lower-case, compose. An ASCII name - which every
+   A-label is, `xn--` and all - has nothing to drop and nothing to compose, and
+   its case fold is the ASCII one, so it skips both normalizations."
   ^String [^String s]
-  (nfkc-case-fold (from-code-points (remove ignored-code-points (code-points s)))))
+  (if (ascii? s)
+    (.toLowerCase s Locale/ROOT)
+    (nfkc-case-fold (from-code-points (remove ignored-code-points (code-points s))))))
 
 (defn- ldh-label? [^String label]
   (and (<= 1 (count label) 63)
@@ -397,11 +410,47 @@
     (+ 4 (count (encode (from-code-points cps))))
     (count label)))
 
+(defn- ldh-span?
+  "Whether `[start end)` of `s` is a letter-digit-hyphen label: 1 to 63 ASCII
+   lower-case letters, digits and hyphens, which may neither open nor close it.
+   An `xn--` label answers false, because a name carrying one has Punycode to
+   decode and is not this simple."
+  [^String s ^long start ^long end]
+  (let [len (- end start)]
+    (and (<= 1 len 63)
+         (not (.startsWith s "xn--" (int start)))
+         (loop [i start]
+           (if (= i end)
+             true
+             (let [c (int (.charAt s (int i)))]
+               (if (or (and (>= c 97) (<= c 122))
+                       (and (>= c 48) (<= c 57))
+                       (and (= c 45) (not= i start) (not= i (dec end))))
+                 (recur (inc i))
+                 false)))))))
+
+(defn- plain-ascii-name?
+  "The names none of the machinery above has anything to say about: pure ASCII
+   and no `xn--` label, so there is nothing to decode, no derived property to
+   look up and no Bidi rule to apply - RFC 1123's shape decides it, in one pass
+   and without a single allocation. Answering false is not a verdict: the name
+   is then read the long way."
+  [^String s]
+  (let [n (.length s)]
+    (and (<= 1 n 253)
+         (ascii? s)
+         (loop [i 0 start 0]
+           (cond
+             (= i n) (ldh-span? s start n)
+             (= (.charAt s i) \.) (if (ldh-span? s start i) (recur (inc i) (inc i)) false)
+             :else (recur (inc i) start))))))
+
 (defn hostname?
   "Whether `s` is an internationalized host name."
   [^String s]
-  (let [mapped (map-string s)
-        cps (code-points mapped)]
+  (let [mapped (map-string s)]
+   (or (plain-ascii-name? mapped)
+    (let [cps (code-points mapped)]
     (and (seq cps)
          (not-any? separators [(first cps) (last cps)])
          (let [labels (->> (partition-by #(boolean (separators %)) cps)
@@ -424,4 +473,4 @@
                             (u-label-ok? cps)))
                         (map vector texts points))
                 (or (not-any? rtl-label? points)
-                    (every? bidi-label-ok? points)))))))
+                    (every? bidi-label-ok? points)))))))))
