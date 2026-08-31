@@ -26,7 +26,10 @@ consumer did not choose. `skjema` binds nothing:
 
 ## Status
 
-Early. The gate is the official
+The reader is done and its gate is green: **318/318** files of
+[JSONTestSuite](https://github.com/nst/JSONTestSuite) (`y_` accepted, `n_`
+refused, `i_` answered), zero reflection warnings, zero dependencies. The
+validator itself is next. The gate is the official
 [JSON-Schema-Test-Suite](https://github.com/json-schema-org/JSON-Schema-Test-Suite)
 for draft 2020-12, `optional/` excluded, and
 [JSONTestSuite](https://github.com/nst/JSONTestSuite) for the reader. Until both
