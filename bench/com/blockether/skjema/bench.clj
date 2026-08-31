@@ -8,13 +8,10 @@
    caller pays it once.
 
    `clojure -M:bench`, or `clojure -M:bench <case>` for one row."
-  (:refer-clojure :exclude [compile])
   (:require [clojure.string :as str]
             [criterium.core :as cc]
             [malli.core :as m]
             [com.blockether.skjema.core :as skjema]))
-
-(set! *warn-on-reflection* true)
 
 ;; --- the schemas, once in each language -------------------------------------
 
@@ -76,11 +73,11 @@
 
 ;; --- measurement ------------------------------------------------------------
 
-(defn- mean-ns [f]
+(defn- mean-ns ^double [f]
   (let [{:keys [mean]} (cc/quick-benchmark (f) {})]
     (* 1e9 (double (first mean)))))
 
-(defn- fmt [ns]
+(defn- fmt [^double ns]
   (cond (< ns 1e3) (format "%.0f ns" ns)
         (< ns 1e6) (format "%.2f us" (/ ns 1e3))
         :else (format "%.2f ms" (/ ns 1e6))))

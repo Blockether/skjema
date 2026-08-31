@@ -22,8 +22,6 @@
   (:import (java.nio ByteBuffer)
            (java.nio.charset CharacterCodingException CodingErrorAction StandardCharsets)))
 
-(set! *warn-on-reflection* true)
-
 (def ^:private default-max-depth
   "How deep a document may nest before it is rejected. Above the 500 levels the
    conformance suite calls implementation-defined, below anything that threatens

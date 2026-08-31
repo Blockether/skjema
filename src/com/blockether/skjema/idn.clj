@@ -30,30 +30,30 @@
   (:import (java.text Normalizer Normalizer$Form)
            (java.util Locale)))
 
-(set! *warn-on-reflection* true)
-
 ;; Punycode (RFC 3492)
 
-(def ^:private p-base 36)
-(def ^:private p-tmin 1)
-(def ^:private p-tmax 26)
-(def ^:private p-skew 38)
-(def ^:private p-damp 700)
-(def ^:private p-initial-bias 72)
-(def ^:private p-initial-n 128)
+(def ^:private ^:const p-base 36)
+(def ^:private ^:const p-tmin 1)
+(def ^:private ^:const p-tmax 26)
+(def ^:private ^:const p-skew 38)
+(def ^:private ^:const p-damp 700)
+(def ^:private ^:const p-initial-bias 72)
+(def ^:private ^:const p-initial-n 128)
 
 (defn- adapt ^long [^long delta ^long numpoints first?]
-  (let [delta (long (if first? (quot delta p-damp) (quot delta 2)))
-        delta (long (+ delta (quot delta numpoints)))]
+  (let [damp (long p-damp) base (long p-base) tmin (long p-tmin)
+        tmax (long p-tmax) skew (long p-skew)
+        delta (long (if first? (quot delta damp) (quot delta 2)))
+        delta (+ delta (quot delta numpoints))]
     (loop [delta delta k 0]
-      (if (> delta (quot (* (- p-base p-tmin) p-tmax) 2))
-        (recur (long (quot delta (- p-base p-tmin))) (long (+ k p-base)))
-        (long (+ k (quot (* (inc (- p-base p-tmin)) delta) (+ delta p-skew))))))))
+      (if (> delta (quot (* (- base tmin) tmax) 2))
+        (recur (quot delta (- base tmin)) (+ k base))
+        (+ k (quot (* (inc (- base tmin)) delta) (+ delta skew)))))))
 
 (defn- threshold ^long [^long k ^long bias]
-  (let [t (- k bias)]
-    (cond (< t p-tmin) p-tmin
-          (> t p-tmax) p-tmax
+  (let [tmin (long p-tmin) tmax (long p-tmax) t (- k bias)]
+    (cond (< t tmin) tmin
+          (> t tmax) tmax
           :else t)))
 
 (defn- basic-digit
@@ -112,7 +112,7 @@
                 (when (>= n' 128)
                   (when (Character/isValidCodePoint (int n'))
                     (recur (vec (concat (subvec out 0 pos) [n'] (subvec out pos)))
-                           (long (inc pos)) (long n') (long bias') (long at'))))))))))))
+                           (inc pos) n' bias' (long at'))))))))))))
 
 (defn encode
   "`s` as the body of an A-label - Punycode, without the `xn--` prefix."
@@ -126,25 +126,25 @@
       (if (>= h (count cps))
         (.toString sb)
         (let [m (long (reduce min (filter #(>= (long %) n) cps)))
-              delta (+ delta (* (- m n) (inc h)))]
-          (let [[delta bias h]
-                (reduce (fn [[delta bias h] cp]
-                          (let [cp (long cp)]
-                            (cond
-                              (< cp m) [(inc delta) bias h]
-                              (> cp m) [delta bias h]
-                              :else
-                              (do (loop [q delta k p-base]
-                                    (let [t (threshold k bias)]
-                                      (if (< q t)
-                                        (.appendCodePoint sb (int (digit-char q)))
-                                        (do (.appendCodePoint
-                                              sb (int (digit-char (+ t (rem (- q t) (- p-base t))))))
-                                            (recur (quot (- q t) (- p-base t)) (+ k p-base))))))
-                                  [0 (adapt delta (inc h) (= h b)) (inc h)]))))
-                        [delta bias h]
-                        cps)]
-            (recur (inc m) (long (inc delta)) (long bias) (long h))))))))
+              delta (+ delta (* (- m n) (inc h)))
+              [delta bias h]
+              (reduce (fn [[delta bias h] cp]
+                        (let [cp (long cp)]
+                          (cond
+                            (< cp m) [(inc delta) bias h]
+                            (> cp m) [delta bias h]
+                            :else
+                            (do (loop [q delta k p-base]
+                                  (let [t (threshold k bias)]
+                                    (if (< q t)
+                                      (.appendCodePoint sb (int (digit-char q)))
+                                      (do (.appendCodePoint
+                                           sb (int (digit-char (+ t (rem (- q t) (- p-base t))))))
+                                          (recur (quot (- q t) (- p-base t)) (+ k p-base))))))
+                                [0 (adapt delta (inc h) (= h b)) (inc h)]))))
+                      [delta bias h]
+                      cps)]
+          (recur (inc m) (long (inc delta)) (long bias) (long h)))))))
 
 ;; The derived property of RFC 5892
 
@@ -199,8 +199,8 @@
    lower case, composed again."
   ^String [^String s]
   (Normalizer/normalize
-    (.toLowerCase (Normalizer/normalize s Normalizer$Form/NFKC) Locale/ROOT)
-    Normalizer$Form/NFC))
+   (.toLowerCase (Normalizer/normalize s Normalizer$Form/NFKC) Locale/ROOT)
+   Normalizer$Form/NFC))
 
 (defn- unstable? [^long cp]
   (let [s (from-code-points [cp])]
@@ -264,7 +264,7 @@
       (right-joining cp) :right
       (and (cursive-scripts (java.lang.Character$UnicodeScript/of (int cp)))
            (#{(int Character/OTHER_LETTER) (int Character/MODIFIER_LETTER)}
-             (Character/getType (int cp))))
+            (Character/getType (int cp))))
       :dual
 
       :else :none)))
@@ -273,7 +273,7 @@
   (and cp (= (java.lang.Character$UnicodeScript/of (int cp))
              (java.lang.Character$UnicodeScript/forName script))))
 
-(defn- skip-transparent [cps i step]
+(defn- skip-transparent [cps ^long i ^long step]
   (loop [i i]
     (if (= :transparent (joining-type (get cps i)))
       (recur (+ i step))
@@ -281,7 +281,7 @@
 
 (defn- contextual-ok?
   "Whether the code point at `i` satisfies the rule that lets it appear."
-  [cps i]
+  [cps ^long i]
   (let [cp (long (nth cps i))
         before (get cps (dec i))
         after (get cps (inc i))]
@@ -449,28 +449,28 @@
   "Whether `s` is an internationalized host name."
   [^String s]
   (let [mapped (map-string s)]
-   (or (plain-ascii-name? mapped)
-    (let [cps (code-points mapped)]
-    (and (seq cps)
-         (not-any? separators [(first cps) (last cps)])
-         (let [labels (->> (partition-by #(boolean (separators %)) cps)
-                           (remove #(separators (first %)))
-                           (mapv vec))
-               texts (mapv from-code-points labels)
+    (or (plain-ascii-name? mapped)
+        (let [cps (code-points mapped)]
+          (and (seq cps)
+               (not-any? separators [(first cps) (last cps)])
+               (let [labels (->> (partition-by #(boolean (separators %)) cps)
+                                 (remove #(separators (first %)))
+                                 (mapv vec))
+                     texts (mapv from-code-points labels)
                ;; every separator run must be a single one: `a..b` has none
                ;; between the two dots and is not a name.
-               empty-label? (some #(> (count %) 1)
-                                  (filter #(separators (first %)) (partition-by #(boolean (separators %)) cps)))
-               points (mapv label-points texts)]
-           (and (not empty-label?)
-                (every? some? points)
-                (every? (fn [[text cps]] (<= 1 (a-label-length text cps) 63))
-                        (map vector texts points))
-                (<= (reduce + (dec (count points)) (map a-label-length texts points)) 253)
-                (every? (fn [[text cps]]
-                          (if (every? #(< (long %) 128) cps)
-                            (ldh-label? (from-code-points cps))
-                            (u-label-ok? cps)))
-                        (map vector texts points))
-                (or (not-any? rtl-label? points)
-                    (every? bidi-label-ok? points)))))))))
+                     empty-label? (some #(> (count %) 1)
+                                        (filter #(separators (first %)) (partition-by #(boolean (separators %)) cps)))
+                     points (mapv label-points texts)]
+                 (and (not empty-label?)
+                      (every? some? points)
+                      (every? (fn [[text cps]] (<= 1 (a-label-length text cps) 63))
+                              (map vector texts points))
+                      (<= (reduce + (dec (count points)) (map a-label-length texts points)) 253)
+                      (every? (fn [[_text cps]]
+                                (if (every? #(< (long %) 128) cps)
+                                  (ldh-label? (from-code-points cps))
+                                  (u-label-ok? cps)))
+                              (map vector texts points))
+                      (or (not-any? rtl-label? points)
+                          (every? bidi-label-ok? points)))))))))

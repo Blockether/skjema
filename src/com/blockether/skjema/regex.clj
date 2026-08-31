@@ -21,8 +21,6 @@
    inline flags `(?i)` are refused even though Java understands two of them."
   (:require [clojure.string :as str]))
 
-(set! *warn-on-reflection* true)
-
 (def ^:private general-categories
   "The long general-category names ECMAScript writes in `\\p{...}` and the short
    ones java.util.regex answers to. Java knows `\\p{L}`; it has never heard of
@@ -87,7 +85,7 @@
   [^String p]
   (let [n (.length p)
         sb (StringBuilder.)
-        at (fn [i] (when (< i n) (.charAt p i)))
+        at (fn [^long i] (when (< i (long n)) (.charAt p (int i))))
         put (fn [s] (.append sb (str s)) nil)]
     (loop [i 0, in-class? false, error nil]
       (if (>= i n)

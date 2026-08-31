@@ -69,8 +69,8 @@
         optional (json-files (io/file root "optional") true)
         format? (fn [^File f] (str/includes? (.getPath f) "/optional/format/"))
         failures (vec (concat
-                        (mapcat #(run-file % nil) required)
-                        (mapcat #(run-file % (when (format? %) {:format-assertion true})) optional)))]
+                       (mapcat #(run-file % nil) required)
+                       (mapcat #(run-file % (when (format? %) {:format-assertion true})) optional)))]
     (testing "the vendored suite is present, required files and optional ones alike"
       (is (<= 40 (count required)))
       (is (<= 30 (count optional)))

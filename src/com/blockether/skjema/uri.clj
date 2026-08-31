@@ -11,8 +11,6 @@
   (:import (java.io ByteArrayOutputStream)
            (java.net URI)))
 
-(set! *warn-on-reflection* true)
-
 (defn strip-fragment
   "The URI without its fragment. `nil` in, empty string out, because the base of
    a schema that never declared one is the empty URI."

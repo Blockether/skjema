@@ -95,8 +95,8 @@
                                 {:registry {"https://example.com/2019.json" older}}))))
     (testing "while the same schema in 2020-12 asserts"
       (is (false? (skjema/valid?
-                    (assoc older "$schema" "https://json-schema.org/draft/2020-12/schema")
-                    [1 2 3]))))))
+                   (assoc older "$schema" "https://json-schema.org/draft/2020-12/schema")
+                   [1 2 3]))))))
 
 (deftest draft-07-spells-a-tuple-with-items
   (let [schema {"$schema" "http://json-schema.org/draft-07/schema#"

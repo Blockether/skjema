@@ -33,17 +33,15 @@
             [com.blockether.skjema.uri :as uri])
   (:import (java.math BigDecimal)))
 
-(set! *warn-on-reflection* true)
-
-(def ^:private max-eval-depth
+(def ^:private ^:const max-eval-depth
   "A cyclic schema (`{\"$ref\": \"#\"}`) recurses without the instance ever
    shrinking. Data-driven recursion terminates on its own; this bound only
    turns the pathological schema into an error a caller can catch."
   2048)
 
 (defrecord Ctx
-  [index dynamic ref-cache base dyn-scope validation? format-assertion? format?
-   annotate? quiet? id-resolved inst-path kw-path res-prefix res-path depth dialect])
+           [index dynamic ref-cache base dyn-scope validation? format-assertion? format?
+            annotate? quiet? id-resolved inst-path kw-path res-prefix res-path depth dialect])
 
 (def ^:private validation-vocabulary
   "https://json-schema.org/draft/2020-12/vocab/validation")
@@ -63,7 +61,7 @@
           (for [f ["schema" "meta-core" "meta-applicator" "meta-unevaluated"
                    "meta-validation" "meta-meta-data" "meta-format-annotation" "meta-content"]
                 :let [doc (json/read-str
-                            (slurp (io/resource (str "com/blockether/skjema/meta/2020-12/" f ".json"))))]]
+                           (slurp (io/resource (str "com/blockether/skjema/meta/2020-12/" f ".json"))))]]
             [(get doc "$id") doc]))))
 
 ;; JSON values
@@ -280,7 +278,7 @@
     (with-meta (persistent! (reduce-kv (fn [acc k v] (assoc! acc k (with-masks v)))
                                        (transient {})
                                        x))
-               (assoc (meta x) ::mask (compute-mask x)))
+      (assoc (meta x) ::mask (compute-mask x)))
 
     (sequential? x) (mapv with-masks x)
     :else x))
@@ -307,28 +305,28 @@
                     (assoc-in [:dynamic base a] entry))
                 acc)]
       (reduce-kv
-        (fn [acc k v]
-          (let [kptr (str ptr "/" (uri/escape-token k))]
-            (cond
-              (subschema-keywords k)
-              (index-schema (cond-> acc (unevaluated-keywords k) (assoc :unevaluated? true))
-                            v base kptr)
+       (fn [acc k v]
+         (let [kptr (str ptr "/" (uri/escape-token k))]
+           (cond
+             (subschema-keywords k)
+             (index-schema (cond-> acc (unevaluated-keywords k) (assoc :unevaluated? true))
+                           v base kptr)
 
-              (and (subschema-array-keywords k) (sequential? v))
-              (first (reduce (fn [[acc i] sub]
-                               [(index-schema acc sub base (str kptr "/" i)) (inc i)])
-                             [acc 0]
-                             v))
+             (and (subschema-array-keywords k) (sequential? v))
+             (first (reduce (fn [[acc i] sub]
+                              [(index-schema acc sub base (str kptr "/" i)) (inc i)])
+                            [acc 0]
+                            v))
 
-              (and (subschema-map-keywords k) (map? v))
-              (reduce-kv (fn [acc kk sub]
-                           (index-schema acc sub base (str kptr "/" (uri/escape-token kk))))
-                         acc
-                         v)
+             (and (subschema-map-keywords k) (map? v))
+             (reduce-kv (fn [acc kk sub]
+                          (index-schema acc sub base (str kptr "/" (uri/escape-token kk))))
+                        acc
+                        v)
 
-              :else acc)))
-        acc
-        schema))))
+             :else acc)))
+       acc
+       schema))))
 
 (defn- pointer-get
   "Walk a JSON Pointer fragment inside one resource, tracking a nested `$id` so
@@ -488,7 +486,7 @@
    bound has to be paid for."
   [ctx]
   (let [depth (inc (long (:depth ctx 0)))]
-    (when (> depth max-eval-depth)
+    (when (> depth (long max-eval-depth))
       (throw (ex-info "schema recursion did not terminate"
                       {:skjema/error :schema/recursion
                        :keywordLocation (pointer nil (:kw-path ctx))})))
@@ -598,20 +596,20 @@
   (if-not (map? instance)
     ok
     (reduce-kv
-      (fn [res k v]
-        (if-not (contains? instance k)
-          res
-          (and-merge (:quiet? ctx) res
-            (if (sequential? v)
-              (let [missing (remove #(contains? instance %) v)]
-                (if (seq missing)
-                  (err (at-keyword ctx "dependencies" k)
-                       (str "property " (pr-str k) " requires "
-                            (str/join ", " (map pr-str missing))))
-                  ok))
-              (f (at-keyword ctx "dependencies" k) v instance)))))
-      ok
-      (get schema "dependencies"))))
+     (fn [res k v]
+       (if-not (contains? instance k)
+         res
+         (and-merge (:quiet? ctx) res
+                    (if (sequential? v)
+                      (let [missing (remove #(contains? instance %) v)]
+                        (if (seq missing)
+                          (err (at-keyword ctx "dependencies" k)
+                               (str "property " (pr-str k) " requires "
+                                    (str/join ", " (map pr-str missing))))
+                          ok))
+                      (f (at-keyword ctx "dependencies" k) v instance)))))
+     ok
+     (get schema "dependencies"))))
 
 (defn- eval-format
   "`format` as an ASSERTION, which happens only where the format-assertion
@@ -710,7 +708,7 @@
       ok
       (let [n (count instance)
             pre-n (if prefix? (min (count prefix) n) 0)
-            end (if items? n pre-n)
+            end (long (if items? n pre-n))
             quiet? (:quiet? ctx)]
         (loop [i 0 res ok]
           (cond
@@ -934,9 +932,9 @@
    tells an implementation that does not have it what to do."
   [ctx meta-schema-uri]
   (boolean
-    (when-let [meta (:schema (lookup ctx meta-schema-uri))]
-      (let [vocab (get meta "$vocabulary")]
-        (and (map? vocab) (contains? vocab format-assertion-vocabulary))))))
+   (when-let [meta (:schema (lookup ctx meta-schema-uri))]
+     (let [vocab (get meta "$vocabulary")]
+       (and (map? vocab) (contains? vocab format-assertion-vocabulary))))))
 
 (def ^:private draft-2019-09-keywords
   #{"$anchor" "$comment" "$defs" "$id" "$recursiveAnchor" "$recursiveRef" "$ref"
@@ -1142,23 +1140,23 @@
                      (uri/strip-fragment (uri/resolve-ref base (get schema "$id")))
                      base)
          acc (update acc :index #(assoc % base {:schema schema :base root-base :ptr ""}
-                                          root-base {:schema schema :base root-base :ptr ""}))]
-     (let [c {:skjema/compiled true
-              :schema schema
-              :base root-base
-              :index (:index acc)
-              :dynamic (:dynamic acc)
+                                        root-base {:schema schema :base root-base :ptr ""}))
+         c {:skjema/compiled true
+            :schema schema
+            :base root-base
+            :index (:index acc)
+            :dynamic (:dynamic acc)
               ;; Annotations exist for `unevaluatedProperties` and
               ;; `unevaluatedItems`. A document that never mentions them has
               ;; nothing to spend a set of evaluated member names on, so none
               ;; is built.
-              :annotate? (boolean (:unevaluated? acc))
+            :annotate? (boolean (:unevaluated? acc))
               ;; `$ref` resolution is string work against a fixed index: the
               ;; same handful of answers, once per compiled schema instead of
               ;; once per instance.
-              :ref-cache (atom {})
-              :format-assertion (boolean (:format-assertion opts))}]
-       (assoc c :ctx (eval-ctx c false) :quiet-ctx (eval-ctx c true))))))
+            :ref-cache (atom {})
+            :format-assertion (boolean (:format-assertion opts))}]
+     (assoc c :ctx (eval-ctx c false) :quiet-ctx (eval-ctx c true)))))
 
 (defn compiled? [x] (boolean (:skjema/compiled x)))
 

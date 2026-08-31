@@ -17,8 +17,6 @@
             [com.blockether.skjema.regex :as regex])
   (:import (java.time LocalDate)))
 
-(set! *warn-on-reflection* true)
-
 ;; Dates, times and durations (RFC 3339)
 
 (def ^:private date-pattern #"(\d{4})-(\d{2})-(\d{2})")
@@ -26,9 +24,9 @@
 (defn- date?
   [^String s]
   (boolean
-    (when-let [[_ y m d] (re-matches date-pattern s)]
-      (try (LocalDate/of (parse-long y) (parse-long m) (parse-long d)) true
-           (catch Exception _ false)))))
+   (when-let [[_ y m d] (re-matches date-pattern s)]
+     (try (LocalDate/of (parse-long y) (parse-long m) (parse-long d)) true
+          (catch Exception _ false)))))
 
 (def ^:private time-pattern
   #"(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|([+-])(\d{2}):(\d{2}))")
@@ -39,15 +37,15 @@
    offset spells it as locally."
   [^String s]
   (boolean
-    (when-let [[_ h m sec sign oh om] (re-matches time-pattern s)]
-      (let [h (parse-long h) m (parse-long m) sec (parse-long sec)
-            oh (some-> oh parse-long) om (some-> om parse-long)
-            offset (if sign (* (if (= sign "-") -1 1) (+ (* 60 oh) om)) 0)]
-        (and (<= h 23) (<= m 59)
-             (or (nil? oh) (and (<= oh 23) (<= om 59)))
-             (if (= sec 60)
-               (= 1439 (mod (- (+ (* 60 h) m) offset) 1440))
-               (<= sec 59)))))))
+   (when-let [[_ h m sec sign oh om] (re-matches time-pattern s)]
+     (let [h (long (parse-long h)) m (long (parse-long m)) sec (long (parse-long sec))
+           oh (some-> oh parse-long) om (some-> om parse-long)
+           offset (long (if sign (* (if (= sign "-") -1 1) (+ (* 60 (long oh)) (long om))) 0))]
+       (and (<= h 23) (<= m 59)
+            (or (nil? oh) (and (<= (long oh) 23) (<= (long om) 59)))
+            (if (= sec 60)
+              (= 1439 (mod (- (+ (* 60 h) m) offset) 1440))
+              (<= sec 59)))))))
 
 (defn- date-time?
   [^String s]
@@ -80,17 +78,17 @@
         v4 "(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}"
         ls32 (str "(?:" h16 ":" h16 "|" v4 ")")]
     (re-pattern
-      (str "(?:"
-           "(?:" h16 ":){6}" ls32
-           "|::(?:" h16 ":){5}" ls32
-           "|(?:" h16 ")?::(?:" h16 ":){4}" ls32
-           "|(?:(?:" h16 ":){0,1}" h16 ")?::(?:" h16 ":){3}" ls32
-           "|(?:(?:" h16 ":){0,2}" h16 ")?::(?:" h16 ":){2}" ls32
-           "|(?:(?:" h16 ":){0,3}" h16 ")?::" h16 ":" ls32
-           "|(?:(?:" h16 ":){0,4}" h16 ")?::" ls32
-           "|(?:(?:" h16 ":){0,5}" h16 ")?::" h16
-           "|(?:(?:" h16 ":){0,6}" h16 ")?::"
-           ")"))))
+     (str "(?:"
+          "(?:" h16 ":){6}" ls32
+          "|::(?:" h16 ":){5}" ls32
+          "|(?:" h16 ")?::(?:" h16 ":){4}" ls32
+          "|(?:(?:" h16 ":){0,1}" h16 ")?::(?:" h16 ":){3}" ls32
+          "|(?:(?:" h16 ":){0,2}" h16 ")?::(?:" h16 ":){2}" ls32
+          "|(?:(?:" h16 ":){0,3}" h16 ")?::" h16 ":" ls32
+          "|(?:(?:" h16 ":){0,4}" h16 ")?::" ls32
+          "|(?:(?:" h16 ":){0,5}" h16 ")?::" h16
+          "|(?:(?:" h16 ":){0,6}" h16 ")?::"
+          ")"))))
 
 (defn- ipv6? [^String s] (boolean (re-matches ipv6-pattern s)))
 
@@ -112,7 +110,6 @@
         pchar (str "(?:[" unreserved sub ":@]|" pct ")")
         query (str "(?:[" unreserved sub ":@/?" (when iri? iprivate) "]|" pct ")*")
         fragment (str "(?:[" unreserved sub ":@/?]|" pct ")*")
-        h16 "[0-9A-Fa-f]{1,4}"
         v4 "(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}"
         ipvfuture (str "[vV][0-9A-Fa-f]+\\.[" unreserved sub ":]+")
         host (str "(?:\\[(?:" ipv6-pattern "|" ipvfuture ")\\]|" v4 "|(?:[" unreserved sub "]|" pct ")*)")
