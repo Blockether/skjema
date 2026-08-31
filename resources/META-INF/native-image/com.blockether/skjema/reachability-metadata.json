@@ -1,0 +1,7 @@
+{
+  "resources": [
+    {
+      "glob": "com/blockether/skjema/meta/2020-12/*.json"
+    }
+  ]
+}

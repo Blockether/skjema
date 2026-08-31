@@ -56,6 +56,24 @@ nothing is ever fetched:
 (skjema/valid? compiled instance)
 ```
 
+A document that references its neighbours by relative path works the same way:
+the registry decides what a name means, so the schemas can live in
+`resources/` and be read with `io/resource` — this library reads nothing off
+the filesystem and opens no socket. A reference nobody supplied is a `compile`
+error, never a silent pass:
+
+```clojure
+(def registry
+  (into {} (for [n ["node.json" "action.json"]]
+             [n (json/read-str (slurp (io/resource (str "contract/" n))))])))
+
+(skjema/compile view-schema {:base "view.json" :registry registry})
+;; "$ref": "node.json" inside it resolves against the base, to the registry key
+```
+
+The 2020-12 meta-schemas ARE read from this jar's own resources, and the jar
+carries the `META-INF/native-image` metadata that registers them — a consumer
+builds a GraalVM native image without knowing that.
 `format` annotates rather than asserts, which is what the specification says by
 default. Ask for the assertion — every format 2020-12 names is implemented,
 `date-time` through `idn-hostname` — with an option, or by declaring the
