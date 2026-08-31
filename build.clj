@@ -53,12 +53,19 @@
                 :basis @basis
                 :src-dirs ["src"]
                 :pom-data (pom-data)})
-  (b/copy-dir {:src-dirs ["src"] :target-dir class-dir})
+  (b/copy-dir {:src-dirs ["src" "resources"] :target-dir class-dir})
   ;; MIT asks that the notice travel with every copy, so the jar carries the
   ;; license text itself — an audit of the artifact alone still sees the terms.
   (b/copy-file {:src "LICENSE" :target (str class-dir "/META-INF/LICENSE")})
   (b/copy-file {:src "NOTICE" :target (str class-dir "/META-INF/NOTICE")})
   (b/jar {:class-dir class-dir :jar-file jar-file})
+  ;; The bundled 2020-12 meta-schemas live in `resources/`, and a jar without
+  ;; them throws on the first `compile` in every consumer — which is exactly how
+  ;; 0.1.0 shipped. The build refuses to hand out an artifact that cannot validate.
+  (let [entry "com/blockether/skjema/meta/2020-12/schema.json"]
+    (with-open [zip (java.util.zip.ZipFile. (java.io.File. ^String jar-file))]
+      (when-not (.getEntry zip entry)
+        (throw (ex-info (str "the jar is missing " entry) {:jar jar-file})))))
   (println "Built:" jar-file "version:" version))
 
 (defn deploy [_]
