@@ -6,7 +6,7 @@
 ;; data that is ALREADY parsed — by us, by charred, by whatever the host uses.
 ;; Nothing here reaches past clojure.core, so native-image needs no
 ;; configuration and no Jackson lands on anybody's classpath.
-{:paths ["src"]
+{:paths ["src" "resources"]
 
  :deps {}
 
