@@ -16,7 +16,7 @@
    fails differently on every machine."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
-            [clojure.test :refer [deftest is testing]]
+            [lazytest.experimental.interfaces.clojure-test :refer [deftest is testing]]
             [com.blockether.skjema.core :as skjema]
             [com.blockether.skjema.json :as json])
   (:import (java.io File)))

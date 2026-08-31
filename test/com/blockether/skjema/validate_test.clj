@@ -2,7 +2,7 @@
   "What a caller reads back: the specification's BASIC output, the options
    that change what asserts, and the keywords a schema older than 2020-12
    still means."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [lazytest.experimental.interfaces.clojure-test :refer [deftest is testing]]
             [com.blockether.skjema.core :as skjema]
             [com.blockether.skjema.json :as json]))
 

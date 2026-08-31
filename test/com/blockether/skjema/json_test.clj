@@ -9,7 +9,7 @@
    mistaken for a well-formed refusal."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
-            [clojure.test :refer [deftest is testing]]
+            [lazytest.experimental.interfaces.clojure-test :refer [deftest is testing thrown?]]
             [com.blockether.skjema.json :as json])
   (:import (java.io File)
            (java.nio.file Files)))

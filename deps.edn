@@ -17,14 +17,14 @@
    :ns-default build}
 
   ;; The gate is the official json-schema-org/JSON-Schema-Test-Suite
-  ;; (tests/draft2020-12, `optional/` excluded) plus nst/JSONTestSuite for the
+  ;; (tests/draft2020-12, `optional/` included) plus nst/JSONTestSuite for the
   ;; reader, both vendored under test/resources — a test never downloads. Test
   ;; scope adds only a runner: the suite files are JSON, so reading them is the
-  ;; reader's own first conformance test.
+  ;; reader's own first conformance test. Lazytest is that runner; a namespace
+  ;; that requires `clojure.test` is silently never discovered, so the tests
+  ;; speak `lazytest.experimental.interfaces.clojure-test` and nothing else.
   :test
   {:extra-paths ["test"]
-   :extra-deps  {org.clojure/clojure {:mvn/version "1.12.4"}
-                 io.github.cognitect-labs/test-runner
-                 {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
-   :main-opts   ["-m" "cognitect.test-runner"]
-   :exec-fn     cognitect.test-runner.api/test}}}
+   :extra-deps  {org.clojure/clojure            {:mvn/version "1.12.4"}
+                 io.github.noahtheduke/lazytest {:mvn/version "2.0.0"}}
+   :main-opts   ["-m" "lazytest.main" "test"]}}}
