@@ -1,0 +1,15 @@
+skjema
+Copyright (c) 2026 Blockether
+
+Licensed under the MIT License; see LICENSE.
+
+The specification implemented here is JSON Schema 2020-12
+(https://json-schema.org/specification), published by the JSON Schema
+organization under the MIT-like terms of its own repositories.
+
+Conformance is measured against json-schema-org/JSON-Schema-Test-Suite and
+nst/JSONTestSuite, vendored under test/resources; both carry their own MIT
+licenses, reproduced beside the vendored files.
+
+No code was copied from any existing validator: this is an independent Clojure
+implementation of the specification.

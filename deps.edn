@@ -1,0 +1,30 @@
+;; skjema — JSON Schema 2020-12 validation for Clojure. See README.md.
+;;
+;; No runtime dependencies, on purpose. A validator that drags a JSON parser in
+;; forces that parser AND its version on every consumer; `skjema.json` is this
+;; library's own RFC 8259 reader/writer, so `skjema.core` compiles and validates
+;; data that is ALREADY parsed — by us, by charred, by whatever the host uses.
+;; Nothing here reaches past clojure.core, so native-image needs no
+;; configuration and no Jackson lands on anybody's classpath.
+{:paths ["src"]
+
+ :deps {}
+
+ :aliases
+ {:build
+  {:deps {io.github.clojure/tools.build {:mvn/version "0.10.9"}
+          slipset/deps-deploy           {:mvn/version "0.2.5"}}
+   :ns-default build}
+
+  ;; The gate is the official json-schema-org/JSON-Schema-Test-Suite
+  ;; (tests/draft2020-12, `optional/` excluded) plus nst/JSONTestSuite for the
+  ;; reader, both vendored under test/resources — a test never downloads. Test
+  ;; scope adds only a runner: the suite files are JSON, so reading them is the
+  ;; reader's own first conformance test.
+  :test
+  {:extra-paths ["test"]
+   :extra-deps  {org.clojure/clojure {:mvn/version "1.12.4"}
+                 io.github.cognitect-labs/test-runner
+                 {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+   :main-opts   ["-m" "cognitect.test-runner"]
+   :exec-fn     cognitect.test-runner.api/test}}}
