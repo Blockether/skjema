@@ -11,8 +11,10 @@ import java.math.BigInteger;
 import java.math.MathContext;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -615,11 +617,61 @@ public final class Fast {
         return result;
     }
 
+    /**
+     * Compile every property, cheapest check first: the walk stops at the first
+     * refusal, so a member a type or a bound can refuse is asked before one that
+     * has to match a regular expression or walk a subtree. A valid instance meets
+     * every check either way - only a refusal gets shorter.
+     */
     private static Map<Object, Node> compileProperties(Object value, IFn patternCompiler) {
         if (!(value instanceof Map<?, ?> values)) return null;
-        HashMap<Object, Node> result = new HashMap<>(values.size() * 2);
-        for (Map.Entry<?, ?> entry : values.entrySet()) result.put(entry.getKey(), compileNode(entry.getValue(), patternCompiler));
+        ArrayList<Property> ordered = new ArrayList<>(values.size());
+        for (Map.Entry<?, ?> entry : values.entrySet()) {
+            ordered.add(new Property(entry.getKey(), entry.getValue(), estimate(entry.getValue())));
+        }
+        ordered.sort(Comparator.comparingInt(Property::cost));
+        LinkedHashMap<Object, Node> result = new LinkedHashMap<>(values.size() * 2);
+        for (Property property : ordered) {
+            result.put(property.name(), compileNode(property.schema(), patternCompiler));
+        }
         return result;
+    }
+
+    private record Property(Object name, Object schema, int cost) {}
+
+    /**
+     * What a subschema is likely to cost, in units of the cheapest keyword there
+     * is. Only the ordering it produces matters, so the weights stay coarse: a
+     * regular expression, a uniqueness scan and a subtree are the expensive shapes,
+     * and an annotation costs nothing because it compiles to no check at all.
+     */
+    private static int estimate(Object raw) {
+        if (!(raw instanceof Map<?, ?> source)) return 0;
+        int cost = 0;
+        for (Map.Entry<?, ?> entry : source.entrySet()) {
+            if (!(entry.getKey() instanceof String keyword)) continue;
+            cost += switch (keyword) {
+                case "pattern", "format", "uniqueItems" -> 8;
+                case "items", "additionalProperties" -> 2 + 4 * estimate(entry.getValue());
+                case "prefixItems", "properties" -> 2 + estimateEach(entry.getValue());
+                case "$schema", "$id", "$anchor", "$defs", "$comment", "title", "description",
+                     "default", "examples", "deprecated", "readOnly", "writeOnly" -> 0;
+                default -> 1;
+            };
+        }
+        return cost;
+    }
+
+    /** The cost of every subschema a map of them or a list of them declares. */
+    private static int estimateEach(Object raw) {
+        int cost = 0;
+        if (raw instanceof Map<?, ?> source) {
+            for (Object member : source.values()) cost += estimate(member);
+            return cost;
+        }
+        List<?> members = list(raw);
+        if (members != null) for (Object member : members) cost += estimate(member);
+        return cost;
     }
 
     private static Map<Object, String[]> compileRequired(Object value) {
