@@ -19,7 +19,7 @@ import java.util.Set;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 
-/** Allocation-sensitive loops used by the Clojure API. */
+/** The compiled validator, plus the allocation-sensitive IDN loops. */
 public final class Fast {
     private Fast() {}
 
@@ -227,106 +227,354 @@ public final class Fast {
             "contains", "minContains", "maxContains", "unevaluatedProperties",
             "unevaluatedItems", "contentSchema");
 
-    @SuppressWarnings("unchecked")
+    private static final Node ANY = value -> true;
+    private static final Node NONE = value -> false;
+    private static final Object MISSING = new Object();
+
+    /**
+     * Compile a schema into the checks it declares and nothing else: a node exists
+     * only because a keyword asked for it, so a small schema costs a small call.
+     * An unsupported keyword aborts the whole compilation and the caller falls back
+     * to the complete evaluator.
+     */
     private static Node compileNode(Object raw, IFn patternCompiler) {
-        if (Boolean.TRUE.equals(raw)) return value -> true;
-        if (Boolean.FALSE.equals(raw)) return value -> false;
+        if (Boolean.TRUE.equals(raw)) return ANY;
+        if (Boolean.FALSE.equals(raw)) return NONE;
         if (!(raw instanceof Map<?, ?> source)) throw new UnsupportedSchema();
-        Object dialect = source.get("$schema");
-        if (dialect instanceof String text && !DIALECTS.contains(text)) throw new UnsupportedSchema();
+        if (source.get("$schema") instanceof String dialect && !DIALECTS.contains(dialect)) throw new UnsupportedSchema();
         for (String keyword : ADVANCED) if (source.containsKey(keyword)) throw new UnsupportedSchema();
         if (source.get("items") instanceof List<?>) throw new UnsupportedSchema();
 
-        Object type = source.get("type");
-        String[] types = strings(type);
-        List<Object> enumValues = source.get("enum") instanceof List<?> values
-                ? new ArrayList<>((List<Object>) values) : null;
-        boolean hasConst = source.containsKey("const");
-        Object constValue = source.get("const");
+        ArrayList<Node> checks = new ArrayList<>();
+        addType(checks, source.get("type"));
+        addValues(checks, source);
+        addNumbers(checks, source);
+        addStrings(checks, source, patternCompiler);
+        addArrays(checks, source, patternCompiler);
+        addObjects(checks, source, patternCompiler);
+        return all(checks);
+    }
 
+    private static Node all(List<Node> checks) {
+        if (checks.isEmpty()) return ANY;
+        if (checks.size() == 1) return checks.get(0);
+        if (checks.size() == 2) {
+            Node first = checks.get(0);
+            Node second = checks.get(1);
+            return value -> first.valid(value) && second.valid(value);
+        }
+        Node[] nodes = checks.toArray(new Node[0]);
+        return value -> {
+            for (Node node : nodes) if (!node.valid(value)) return false;
+            return true;
+        };
+    }
+
+    private static void addType(List<Node> checks, Object declared) {
+        if (declared == null) return;
+        String[] types = strings(declared);
+        if (types.length == 1) {
+            checks.add(typeNode(types[0]));
+            return;
+        }
+        Node[] nodes = new Node[types.length];
+        for (int i = 0; i < types.length; i++) nodes[i] = typeNode(types[i]);
+        checks.add(value -> {
+            for (Node node : nodes) if (node.valid(value)) return true;
+            return false;
+        });
+    }
+
+    private static Node typeNode(String type) {
+        return switch (type) {
+            case "null" -> value -> value == null;
+            case "boolean" -> value -> value instanceof Boolean;
+            case "object" -> value -> value instanceof Map<?, ?>;
+            case "array" -> value -> list(value) != null;
+            case "number" -> Fast::jsonNumber;
+            case "integer" -> value -> jsonNumber(value) && integral((Number) value);
+            case "string" -> value -> value instanceof String;
+            default -> throw new UnsupportedSchema();
+        };
+    }
+
+    private static void addValues(List<Node> checks, Map<?, ?> source) {
+        Object declared = source.get("enum");
+        if (declared != null) {
+            if (!(declared instanceof List<?> values)) throw new UnsupportedSchema();
+            checks.add(enumNode(values));
+        }
+        if (source.containsKey("const")) {
+            Object expected = canonical(source.get("const"));
+            checks.add(value -> expected == null ? value == null : expected.equals(canonical(value)));
+        }
+    }
+
+    /** A string-only enum answers from a set; anything else compares canonical JSON values. */
+    private static Node enumNode(List<?> values) {
+        boolean strings = !values.isEmpty();
+        for (Object value : values) {
+            if (!(value instanceof String)) {
+                strings = false;
+                break;
+            }
+        }
+        if (strings) {
+            HashSet<Object> allowed = new HashSet<>(values);
+            return value -> value instanceof String && allowed.contains(value);
+        }
+        Object[] allowed = new Object[values.size()];
+        for (int i = 0; i < values.size(); i++) allowed[i] = canonical(values.get(i));
+        return value -> {
+            Object actual = canonical(value);
+            for (Object expected : allowed) {
+                if (expected == null ? actual == null : expected.equals(actual)) return true;
+            }
+            return false;
+        };
+    }
+
+    private static void addNumbers(List<Node> checks, Map<?, ?> source) {
         Number multipleOf = number(source.get("multipleOf"));
+        if (multipleOf != null) checks.add(new MultipleOf(multipleOf));
         Number maximum = number(source.get("maximum"));
+        if (maximum != null) checks.add(new Bound(maximum, true, false));
         Number exclusiveMaximum = number(source.get("exclusiveMaximum"));
+        if (exclusiveMaximum != null) checks.add(new Bound(exclusiveMaximum, true, true));
         Number minimum = number(source.get("minimum"));
+        if (minimum != null) checks.add(new Bound(minimum, false, false));
         Number exclusiveMinimum = number(source.get("exclusiveMinimum"));
+        if (exclusiveMinimum != null) checks.add(new Bound(exclusiveMinimum, false, true));
+    }
 
-        Long maxLength = nonnegativeLong(source.get("maxLength"));
-        Long minLength = nonnegativeLong(source.get("minLength"));
-        Pattern pattern = source.get("pattern") instanceof String text
-                ? (Pattern) patternCompiler.invoke(text) : null;
+    /**
+     * Both bounds of a string are usually settled without counting code points: a
+     * code point is never more than two UTF-16 units and never fewer than one, so
+     * the unit count brackets the answer.
+     */
+    private static void addStrings(List<Node> checks, Map<?, ?> source, IFn patternCompiler) {
+        Long declaredMax = nonnegativeLong(source.get("maxLength"));
+        if (declaredMax != null) {
+            long max = declaredMax;
+            checks.add(value -> {
+                if (!(value instanceof String text)) return true;
+                int units = text.length();
+                if (units <= max) return true;
+                if ((units + 1) / 2 > max) return false;
+                return text.codePointCount(0, units) <= max;
+            });
+        }
+        Long declaredMin = nonnegativeLong(source.get("minLength"));
+        if (declaredMin != null) {
+            long min = declaredMin;
+            checks.add(value -> {
+                if (!(value instanceof String text)) return true;
+                int units = text.length();
+                if (units < min) return false;
+                if ((units + 1) / 2 >= min) return true;
+                return text.codePointCount(0, units) >= min;
+            });
+        }
+        if (source.get("pattern") instanceof String text) {
+            Pattern pattern = (Pattern) patternCompiler.invoke(text);
+            checks.add(value -> !(value instanceof String actual) || pattern.matcher(actual).find());
+        }
+    }
 
+    private static void addArrays(List<Node> checks, Map<?, ?> source, IFn patternCompiler) {
         Long maxItems = nonnegativeLong(source.get("maxItems"));
         Long minItems = nonnegativeLong(source.get("minItems"));
-        boolean uniqueItems = Boolean.TRUE.equals(source.get("uniqueItems"));
-        Node items = schemaNode(source.get("items"), patternCompiler);
+        boolean unique = Boolean.TRUE.equals(source.get("uniqueItems"));
         List<Node> prefixItems = compileNodes(source.get("prefixItems"), patternCompiler);
+        Node items = schemaNode(source.get("items"), patternCompiler);
+        if (maxItems == null && minItems == null && !unique && prefixItems == null && items == null) return;
+        checks.add(new ArrayNode(
+                minItems == null ? -1L : minItems,
+                maxItems == null ? -1L : maxItems,
+                unique,
+                prefixItems == null ? null : prefixItems.toArray(new Node[0]),
+                items));
+    }
 
+    private static void addObjects(List<Node> checks, Map<?, ?> source, IFn patternCompiler) {
         Long maxProperties = nonnegativeLong(source.get("maxProperties"));
         Long minProperties = nonnegativeLong(source.get("minProperties"));
-        Map<Object, Node> properties = compileProperties(source.get("properties"), patternCompiler);
         String[] required = strings(source.get("required"));
+        Map<Object, Node> properties = compileProperties(source.get("properties"), patternCompiler);
         Map<Object, String[]> dependentRequired = compileRequired(source.get("dependentRequired"));
         boolean hasAdditional = source.containsKey("additionalProperties");
-        Node additional = schemaNode(source.get("additionalProperties"), patternCompiler);
+        if (maxProperties == null && minProperties == null && required == null
+                && properties == null && dependentRequired == null && !hasAdditional) {
+            return;
+        }
+        checks.add(new ObjectNode(
+                minProperties == null ? -1L : minProperties,
+                maxProperties == null ? -1L : maxProperties,
+                required,
+                properties,
+                dependentRequired,
+                hasAdditional,
+                schemaNode(source.get("additionalProperties"), patternCompiler)));
+    }
 
-        return value -> {
-            if (types != null && !matchesAnyType(types, value)) return false;
-            if (enumValues != null && enumValues.stream().noneMatch(expected -> jsonEqual(expected, value))) return false;
-            if (hasConst && !jsonEqual(constValue, value)) return false;
+    /** One numeric bound. An integral bound answers integral instances in primitives. */
+    private static final class Bound implements Node {
+        private final Number bound;
+        private final long integral;
+        private final boolean isIntegral;
+        private final boolean upper;
+        private final boolean exclusive;
 
-            if (jsonNumber(value)) {
-                Number actual = (Number) value;
-                if (multipleOf != null && !multipleOf(actual, multipleOf)) return false;
-                if (maximum != null && compare(actual, maximum) > 0) return false;
-                if (exclusiveMaximum != null && compare(actual, exclusiveMaximum) >= 0) return false;
-                if (minimum != null && compare(actual, minimum) < 0) return false;
-                if (exclusiveMinimum != null && compare(actual, exclusiveMinimum) <= 0) return false;
+        Bound(Number bound, boolean upper, boolean exclusive) {
+            this.bound = bound;
+            this.upper = upper;
+            this.exclusive = exclusive;
+            this.isIntegral = fitsLong(bound);
+            this.integral = this.isIntegral ? bound.longValue() : 0L;
+        }
+
+        @Override
+        public boolean valid(Object value) {
+            if (isIntegral) {
+                if (value instanceof Long actual) return accept(Long.compare(actual, integral));
+                if (value instanceof Integer actual) return accept(Long.compare(actual, integral));
             }
-            if (value instanceof String text) {
-                int length = text.codePointCount(0, text.length());
-                if (maxLength != null && length > maxLength) return false;
-                if (minLength != null && length < minLength) return false;
-                if (pattern != null && !pattern.matcher(text).find()) return false;
-            }
+            if (!(value instanceof Number actual) || !jsonNumber(actual)) return true;
+            return accept(compare(actual, bound));
+        }
 
+        private boolean accept(int sign) {
+            if (upper) return exclusive ? sign < 0 : sign <= 0;
+            return exclusive ? sign > 0 : sign >= 0;
+        }
+    }
+
+    private static final class MultipleOf implements Node {
+        private final Number divisor;
+        private final long integral;
+        private final boolean isIntegral;
+
+        MultipleOf(Number divisor) {
+            this.divisor = divisor;
+            this.isIntegral = fitsLong(divisor) && divisor.longValue() != 0L;
+            this.integral = this.isIntegral ? divisor.longValue() : 0L;
+        }
+
+        @Override
+        public boolean valid(Object value) {
+            if (isIntegral) {
+                if (value instanceof Long actual) return actual % integral == 0L;
+                if (value instanceof Integer actual) return actual % integral == 0L;
+            }
+            if (!(value instanceof Number actual) || !jsonNumber(actual)) return true;
+            return multipleOf(actual, divisor);
+        }
+    }
+
+    /** Every array keyword the schema declared, over one look at the instance. */
+    private static final class ArrayNode implements Node {
+        private final long min;
+        private final long max;
+        private final boolean unique;
+        private final Node[] prefixItems;
+        private final Node items;
+
+        ArrayNode(long min, long max, boolean unique, Node[] prefixItems, Node items) {
+            this.min = min;
+            this.max = max;
+            this.unique = unique;
+            this.prefixItems = prefixItems;
+            this.items = items;
+        }
+
+        @Override
+        public boolean valid(Object value) {
             List<?> array = list(value);
-            if (array != null) {
-                int size = array.size();
-                if (maxItems != null && size > maxItems) return false;
-                if (minItems != null && size < minItems) return false;
-                if (uniqueItems && hasDuplicate(array)) return false;
-                int prefixed = prefixItems == null ? 0 : Math.min(prefixItems.size(), size);
-                for (int i = 0; i < prefixed; i++) if (!prefixItems.get(i).valid(array.get(i))) return false;
-                if (items != null) for (int i = prefixed; i < size; i++) if (!items.valid(array.get(i))) return false;
-            }
+            if (array == null) return true;
+            int size = array.size();
+            if (max >= 0 && size > max) return false;
+            if (min >= 0 && size < min) return false;
+            if (unique && hasDuplicate(array)) return false;
+            int prefixed = prefixItems == null ? 0 : Math.min(prefixItems.length, size);
+            for (int i = 0; i < prefixed; i++) if (!prefixItems[i].valid(array.get(i))) return false;
+            if (items != null) for (int i = prefixed; i < size; i++) if (!items.valid(array.get(i))) return false;
+            return true;
+        }
+    }
 
-            if (value instanceof Map<?, ?> object) {
-                int size = object.size();
-                if (maxProperties != null && size > maxProperties) return false;
-                if (minProperties != null && size < minProperties) return false;
-                if (required != null) for (String name : required) if (!object.containsKey(name)) return false;
-                if (dependentRequired != null) {
-                    for (Map.Entry<Object, String[]> entry : dependentRequired.entrySet()) {
-                        if (object.containsKey(entry.getKey())) {
-                            for (String name : entry.getValue()) if (!object.containsKey(name)) return false;
-                        }
+    /** Every object keyword the schema declared, one map lookup per property. */
+    private static final class ObjectNode implements Node {
+        private final long min;
+        private final long max;
+        private final String[] required;
+        private final Object[] names;
+        private final Node[] nodes;
+        private final Set<Object> declared;
+        private final Object[] dependentOn;
+        private final String[][] dependentNames;
+        private final boolean hasAdditional;
+        private final Node additional;
+
+        ObjectNode(long min, long max, String[] required, Map<Object, Node> properties,
+                   Map<Object, String[]> dependentRequired, boolean hasAdditional, Node additional) {
+            this.min = min;
+            this.max = max;
+            this.required = required;
+            this.hasAdditional = hasAdditional;
+            this.additional = additional;
+            int count = properties == null ? 0 : properties.size();
+            this.names = count == 0 ? null : new Object[count];
+            this.nodes = count == 0 ? null : new Node[count];
+            if (count > 0) {
+                int i = 0;
+                for (Map.Entry<Object, Node> entry : properties.entrySet()) {
+                    names[i] = entry.getKey();
+                    nodes[i] = entry.getValue();
+                    i++;
+                }
+            }
+            this.declared = hasAdditional && properties != null ? new HashSet<>(properties.keySet()) : null;
+            int dependents = dependentRequired == null ? 0 : dependentRequired.size();
+            this.dependentOn = dependents == 0 ? null : new Object[dependents];
+            this.dependentNames = dependents == 0 ? null : new String[dependents][];
+            if (dependents > 0) {
+                int i = 0;
+                for (Map.Entry<Object, String[]> entry : dependentRequired.entrySet()) {
+                    dependentOn[i] = entry.getKey();
+                    dependentNames[i] = entry.getValue();
+                    i++;
+                }
+            }
+        }
+
+        @Override
+        public boolean valid(Object value) {
+            if (!(value instanceof Map<?, ?> object)) return true;
+            if (max >= 0 && object.size() > max) return false;
+            if (min >= 0 && object.size() < min) return false;
+            if (required != null) for (String name : required) if (!object.containsKey(name)) return false;
+            if (dependentOn != null) {
+                for (int i = 0; i < dependentOn.length; i++) {
+                    if (object.containsKey(dependentOn[i])) {
+                        for (String name : dependentNames[i]) if (!object.containsKey(name)) return false;
                     }
                 }
-                if (properties != null) {
-                    for (Map.Entry<Object, Node> entry : properties.entrySet()) {
-                        if (object.containsKey(entry.getKey()) && !entry.getValue().valid(object.get(entry.getKey()))) return false;
-                    }
+            }
+            if (names != null) {
+                for (int i = 0; i < names.length; i++) {
+                    Object member = lookup(object, names[i]);
+                    if (member != MISSING && !nodes[i].valid(member)) return false;
                 }
-                if (hasAdditional) {
-                    for (Map.Entry<?, ?> entry : object.entrySet()) {
-                        if (properties == null || !properties.containsKey(entry.getKey())) {
-                            if (additional == null || !additional.valid(entry.getValue())) return false;
-                        }
+            }
+            if (hasAdditional) {
+                for (Map.Entry<?, ?> entry : object.entrySet()) {
+                    if (declared == null || !declared.contains(entry.getKey())) {
+                        if (additional == null || !additional.valid(entry.getValue())) return false;
                     }
                 }
             }
             return true;
-        };
+        }
     }
 
     private static Node schemaNode(Object value, IFn patternCompiler) {
@@ -383,22 +631,15 @@ public final class Fast {
         return result >= 0 ? result : null;
     }
 
-    private static boolean matchesAnyType(String[] types, Object value) {
-        for (String type : types) if (matchesType(type, value)) return true;
-        return false;
+    /** One lookup that still tells a JSON `null` member apart from a missing one. */
+    private static Object lookup(Map<?, ?> object, Object key) {
+        if (object instanceof clojure.lang.ILookup source) return source.valAt(key, MISSING);
+        Object value = object.get(key);
+        return value == null && !object.containsKey(key) ? MISSING : value;
     }
 
-    private static boolean matchesType(String type, Object value) {
-        return switch (type) {
-            case "null" -> value == null;
-            case "boolean" -> value instanceof Boolean;
-            case "object" -> value instanceof Map<?, ?>;
-            case "array" -> list(value) != null;
-            case "number" -> jsonNumber(value);
-            case "integer" -> jsonNumber(value) && integral((Number) value);
-            case "string" -> value instanceof String;
-            default -> true;
-        };
+    private static boolean fitsLong(Number value) {
+        return value instanceof Long || value instanceof Integer || value instanceof Short || value instanceof Byte;
     }
 
     private static List<?> list(Object value) {
