@@ -218,22 +218,32 @@
   [m bit]
   `(not (zero? (bit-and (long ~m) ~bit))))
 
+(def ^:private keyword-names
+  "Every keyword an evaluation would otherwise have to look up. The position is
+   arbitrary but fixed: it names the bit a node's mask lights up AND the slot its
+   value is prebuilt into, and the count has to stay inside a long."
+  ["$ref" "$dynamicRef" "allOf" "anyOf" "oneOf" "not" "if"
+   "dependentSchemas" "dependencies"
+   "properties" "patternProperties" "additionalProperties"
+   "propertyNames" "prefixItems" "items" "contains"
+   "unevaluatedProperties" "unevaluatedItems"
+   "format" "$id" "$schema"
+   "type" "enum" "const"
+   "multipleOf" "maximum" "exclusiveMaximum" "minimum" "exclusiveMinimum"
+   "maxLength" "minLength" "pattern"
+   "maxItems" "minItems" "uniqueItems"
+   "maxProperties" "minProperties" "required" "dependentRequired"])
+
 (def ^:private keyword-mask
-  "One bit for every keyword the evaluation would otherwise have to look up.
-   The order is arbitrary; only the count matters, and it has to stay inside a
-   long."
-  (zipmap ["$ref" "$dynamicRef" "allOf" "anyOf" "oneOf" "not" "if"
-           "dependentSchemas" "dependencies"
-           "properties" "patternProperties" "additionalProperties"
-           "propertyNames" "prefixItems" "items" "contains"
-           "unevaluatedProperties" "unevaluatedItems"
-           "format" "$id" "$schema"
-           "type" "enum" "const"
-           "multipleOf" "maximum" "exclusiveMaximum" "minimum" "exclusiveMinimum"
-           "maxLength" "minLength" "pattern"
-           "maxItems" "minItems" "uniqueItems"
-           "maxProperties" "minProperties" "required" "dependentRequired"]
-          (iterate #(bit-shift-left ^long % 1) 1)))
+  "One bit per keyword, so a node stops being asked about the ones it does not
+   carry."
+  (zipmap keyword-names (iterate #(bit-shift-left ^long % 1) 1)))
+
+(def ^:private keyword-index
+  "Where each keyword's value sits in a node's prebuilt slots."
+  (zipmap keyword-names (range)))
+
+(def ^:private slot-count (count keyword-names))
 
 (defmacro ^:private defmask
   "Name the bit a keyword lights up, or the bits a group of them share. A
@@ -295,6 +305,42 @@
   "maxItems" "minItems" "uniqueItems"
   "maxProperties" "minProperties" "required" "dependentRequired")
 
+(defmask m-additional-props "additionalProperties")
+(defmask m-items "items")
+
+(defmacro ^:private defslot
+  "Name the slot a keyword's value is prebuilt into, the way `defmask` names its
+   bit. Reading a keyword is then an array index and not a scan of the node's own
+   string keys, which is what a map of the schema costs on every instance."
+  [sym kw]
+  `(def ~(vary-meta sym assoc :private true :const true)
+     ~(or (keyword-index kw)
+          (throw (ex-info (str "no slot for " kw) {:keyword kw})))))
+
+(defslot s-properties "properties")
+(defslot s-pattern-properties "patternProperties")
+(defslot s-additional-properties "additionalProperties")
+(defslot s-prefix-items "prefixItems")
+(defslot s-items "items")
+(defslot s-type "type")
+(defslot s-enum "enum")
+(defslot s-const "const")
+(defslot s-multiple-of "multipleOf")
+(defslot s-maximum "maximum")
+(defslot s-exclusive-maximum "exclusiveMaximum")
+(defslot s-minimum "minimum")
+(defslot s-exclusive-minimum "exclusiveMinimum")
+(defslot s-max-length "maxLength")
+(defslot s-min-length "minLength")
+(defslot s-pattern "pattern")
+(defslot s-max-items "maxItems")
+(defslot s-min-items "minItems")
+(defslot s-unique-items "uniqueItems")
+(defslot s-max-properties "maxProperties")
+(defslot s-min-properties "minProperties")
+(defslot s-required "required")
+(defslot s-dependent-required "dependentRequired")
+
 (defn- compute-mask
   "The mask of a node read straight off its keys."
   ^long [schema]
@@ -303,6 +349,24 @@
              0
              schema))
 
+(def ^:private no-slots
+  "The prebuilt values of a node that carries no keyword at all - shared, because
+   a map inside `properties` or `enum` is walked like any other node and would
+   otherwise get an array of its own."
+  (object-array slot-count))
+
+(defn- compute-slots
+  "A node's keyword values in one array. Evaluation then reads a keyword by
+   position instead of scanning the node's own string keys once per keyword, and
+   the array is built where every other per-node fact is: at compile time."
+  ^objects [schema]
+  (let [^objects a (object-array slot-count)]
+    (reduce-kv (fn [^objects a k v]
+                 (when-some [i (keyword-index k)] (aset a (int i) v))
+                 a)
+               a
+               schema)))
+
 (defn- mask
   "The mask `with-masks` attached, or the one this node has to be read for -
    a node the compiler never saw, such as the view a legacy dialect makes."
@@ -310,19 +374,28 @@
   (let [m (::mask (meta schema))]
     (if m (long m) (compute-mask schema))))
 
+(defn- slots
+  "The values `with-masks` prebuilt, or the ones a node the compiler never saw
+   has to be read for."
+  ^objects [schema]
+  (or (::slots (meta schema)) (compute-slots schema)))
+
 (defn- with-masks
-  "Attach every node's mask ONCE, when the schema is compiled. Nothing else in
-   the document changes, so a mask on a value that is not a schema - inside an
-   `enum`, say - is paid for at compile time and never read."
+  "Attach every node's mask and prebuilt keyword values ONCE, when the schema is
+   compiled. Nothing else in the document changes, so a mask on a value that is
+   not a schema - inside an `enum`, say - is paid for at compile time and never
+   read."
   [x]
   (cond
     (map? x)
-    (with-meta (persistent! (reduce-kv (fn [acc k v] (assoc! acc k (with-masks v)))
+    (let [node (persistent! (reduce-kv (fn [acc k v] (assoc! acc k (with-masks v)))
                                        (transient {})
                                        x))
-      (assoc (meta x) ::mask (compute-mask x)))
+          m (compute-mask node)]
+      (with-meta node (assoc (meta x)
+                             ::mask m
+                             ::slots (if (zero? m) no-slots (compute-slots node)))))
 
-    (sequential? x) (mapv with-masks x)
     (sequential? x) (mapv with-masks x)
     :else x))
 
@@ -784,13 +857,13 @@
 
 (defn- eval-object-applicators
   "Evaluate properties, patternProperties and additionalProperties in one pass."
-  [f ctx schema instance]
-  (let [props (get schema "properties")
-        patterns (get schema "patternProperties")
-        additional (get schema "additionalProperties" absent)
+  [f km ^objects sl ctx schema instance]
+  (let [props (aget sl s-properties)
+        patterns (aget sl s-pattern-properties)
+        additional (aget sl s-additional-properties)
         props? (map? props)
         patterns? (and (map? patterns) (seq patterns))
-        additional? (not (identical? absent additional))]
+        additional? (has? km m-additional-props)]
     (if-not (and (map? instance) (or props? patterns? additional?))
       ok
       (let [annotate? (:annotate? ctx)
@@ -864,10 +937,10 @@
    them. The indices they touched are what `unevaluatedItems` later subtracts -
    and that set is only built when the document has an `unevaluated*` to spend
    it on."
-  [f ctx schema instance]
-  (let [prefix (get schema "prefixItems")
-        items (get schema "items" absent)
-        items? (not (identical? absent items))
+  [f km ^objects sl ctx schema instance]
+  (let [prefix (aget sl s-prefix-items)
+        items (aget sl s-items)
+        items? (has? km m-items)
         prefix? (sequential? prefix)]
     (if-not (and (sequential? instance) (or prefix? items?))
       ok
@@ -956,12 +1029,12 @@
 
 ;; Assertions (the validation vocabulary)
 
-(defn- assert-numbers [km ctx schema instance res]
-  (let [divisor (when (has? km m-multiple-of) (get schema "multipleOf"))
-        maximum (when (has? km m-maximum) (get schema "maximum"))
-        exclusive-max (when (has? km m-exclusive-maximum) (get schema "exclusiveMaximum"))
-        minimum (when (has? km m-minimum) (get schema "minimum"))
-        exclusive-min (when (has? km m-exclusive-minimum) (get schema "exclusiveMinimum"))
+(defn- assert-numbers [^objects sl ctx instance res]
+  (let [divisor (aget sl s-multiple-of)
+        maximum (aget sl s-maximum)
+        exclusive-max (aget sl s-exclusive-maximum)
+        minimum (aget sl s-minimum)
+        exclusive-min (aget sl s-exclusive-minimum)
         res (if (and (number? divisor) (not (multiple-of? instance divisor)))
               (merge-res res (err (at-keyword ctx "multipleOf")
                                   {:multipleOf divisor}
@@ -988,10 +1061,10 @@
                           (str instance " is not above the exclusive minimum " exclusive-min)))
       res)))
 
-(defn- assert-strings [km ctx schema instance res]
-  (let [max-length (when (has? km m-max-length) (get schema "maxLength"))
-        min-length (when (has? km m-min-length) (get schema "minLength"))
-        pattern (when (has? km m-pattern) (get schema "pattern"))
+(defn- assert-strings [^objects sl ctx instance res]
+  (let [max-length (aget sl s-max-length)
+        min-length (aget sl s-min-length)
+        pattern (aget sl s-pattern)
         length (when (or (number? max-length) (number? min-length))
                  (code-point-count instance))
         res (if (and (number? max-length) (> (long length) (long max-length)))
@@ -1020,10 +1093,10 @@
           [i j]
           (recur (assoc seen value i) (inc i)))))))
 
-(defn- assert-arrays [km ctx schema instance res]
-  (let [max-items (when (has? km m-max-items) (get schema "maxItems"))
-        min-items (when (has? km m-min-items) (get schema "minItems"))
-        unique? (and (has? km m-unique-items) (true? (get schema "uniqueItems")))
+(defn- assert-arrays [^objects sl ctx instance res]
+  (let [max-items (aget sl s-max-items)
+        min-items (aget sl s-min-items)
+        unique? (true? (aget sl s-unique-items))
         n (when (or (number? max-items) (number? min-items)) (count instance))
         res (if (and (number? max-items) (> (long n) (long max-items)))
               (merge-res res (err (at-keyword ctx "maxItems")
@@ -1043,11 +1116,11 @@
         res)
       res)))
 
-(defn- assert-objects [km ctx schema instance res]
-  (let [max-props (when (has? km m-max-properties) (get schema "maxProperties"))
-        min-props (when (has? km m-min-properties) (get schema "minProperties"))
-        required (when (has? km m-required) (get schema "required"))
-        dependent (when (has? km m-dependent-required) (get schema "dependentRequired"))
+(defn- assert-objects [^objects sl ctx instance res]
+  (let [max-props (aget sl s-max-properties)
+        min-props (aget sl s-min-properties)
+        required (aget sl s-required)
+        dependent (aget sl s-dependent-required)
         n (when (or (number? max-props) (number? min-props)) (count instance))
         res (if (and (number? max-props) (> (long n) (long max-props)))
               (merge-res res (err (at-keyword ctx "maxProperties")
@@ -1089,9 +1162,9 @@
 
 (defn- eval-assertions
   "Evaluate the validation vocabulary by the instance's JSON type."
-  [^long km ctx schema instance]
+  [^long km ^objects sl ctx instance]
   (let [res (if (has? km m-type)
-              (let [t (get schema "type")
+              (let [t (aget sl s-type)
                     types (if (sequential? t) t [t])]
                 (if (some #(type-match? % instance) types)
                   ok
@@ -1099,14 +1172,16 @@
                        {:type t}
                        (str "expected " (str/join " or " types) ", got " (json-type instance)))))
               ok)
-        res (if (and (has? km m-enum)
-                     (not (some #(json-equal? % instance) (get schema "enum"))))
-              (merge-res res (err (at-keyword ctx "enum")
-                                  {:allowedValues (get schema "enum")}
-                                  "the instance is not one of the enumerated values"))
+        res (if (has? km m-enum)
+              (let [values (aget sl s-enum)]
+                (if (some #(json-equal? % instance) values)
+                  res
+                  (merge-res res (err (at-keyword ctx "enum")
+                                      {:allowedValues values}
+                                      "the instance is not one of the enumerated values"))))
               res)
         res (if (has? km m-const)
-              (let [const (get schema "const")]
+              (let [const (aget sl s-const)]
                 (if (json-equal? const instance)
                   res
                   (merge-res res (err (at-keyword ctx "const")
@@ -1115,10 +1190,10 @@
                                            (json-str const))))))
               res)]
     (cond
-      (json-number? instance) (if (has? km m-numbers) (assert-numbers km ctx schema instance res) res)
-      (string? instance) (if (has? km m-strings) (assert-strings km ctx schema instance res) res)
-      (map? instance) (if (has? km m-objects) (assert-objects km ctx schema instance res) res)
-      (sequential? instance) (if (has? km m-arrays) (assert-arrays km ctx schema instance res) res)
+      (json-number? instance) (if (has? km m-numbers) (assert-numbers sl ctx instance res) res)
+      (string? instance) (if (has? km m-strings) (assert-strings sl ctx instance res) res)
+      (map? instance) (if (has? km m-objects) (assert-objects sl ctx instance res) res)
+      (sequential? instance) (if (has? km m-arrays) (assert-arrays sl ctx instance res) res)
       :else res)))
 
 ;; The evaluator
@@ -1242,6 +1317,7 @@
           ;; compiler never saw and whose mask is therefore read here.
           view (if-let [keywords (:dialect ctx)] (dialect-view keywords schema) schema)
           km (if (identical? view schema) km (compute-mask view))
+          sl (if (identical? view schema) (slots schema) (compute-slots view))
           schema view
           quiet? (:quiet? ctx)
           validation? (:validation? ctx true)
@@ -1278,19 +1354,19 @@
           object? (map? instance)
           array? (sequential? instance)
           res (if (and object? (has? km m-object))
-                (and-merge quiet? res (eval-object-applicators eval-schema ctx schema instance))
+                (and-merge quiet? res (eval-object-applicators eval-schema km sl ctx schema instance))
                 res)
           res (if (and object? (has? km m-property-names))
                 (and-merge quiet? res (eval-property-names eval-schema ctx schema instance))
                 res)
           res (if (and array? (has? km m-array))
-                (and-merge quiet? res (eval-array-applicators eval-schema ctx schema instance))
+                (and-merge quiet? res (eval-array-applicators eval-schema km sl ctx schema instance))
                 res)
           res (if (and array? (has? km m-contains))
                 (and-merge quiet? res (eval-contains validation? eval-schema ctx schema instance))
                 res)
           res (if (and validation? (has? km m-assertions))
-                (and-merge quiet? res (eval-assertions km ctx schema instance))
+                (and-merge quiet? res (eval-assertions km sl ctx instance))
                 res)
           res (if (and (has? km m-format) (:format? ctx) (string? (get schema "format")))
                 (and-merge quiet? res (eval-format ctx schema instance))

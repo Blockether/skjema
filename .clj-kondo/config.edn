@@ -1,11 +1,13 @@
 ;; skjema — clj-kondo.
 ;;
-;; `defmask` is this repository's own macro (src/com/blockether/skjema/core.clj):
-;; it defs one private constant naming the bits a keyword lights up, so the
-;; linter reads it as the `def` it expands to. Without this the masks are 56
-;; unresolved symbols and the report is noise.
+;; `defmask` and `defslot` are this repository's own macros
+;; (src/com/blockether/skjema/core.clj): each defs one private constant - the
+;; bits a keyword lights up, and the array position its value is prebuilt into -
+;; so the linter reads them as the `def` they expand to. Without this the masks
+;; and slots are 79 unresolved symbols and the report is noise.
 ;; The tests speak lazytest's `clojure-test` interface, whose `deftest` the
 ;; linter otherwise reads as an unresolved symbol per test.
 {:lint-as {com.blockether.skjema.core/defmask clojure.core/def
+           com.blockether.skjema.core/defslot clojure.core/def
            lazytest.experimental.interfaces.clojure-test/deftest clojure.test/deftest
            lazytest.experimental.interfaces.clojure-test/testing clojure.test/testing}}

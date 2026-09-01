@@ -840,7 +840,25 @@ public final class Fast {
         return BigDecimal.valueOf(value.longValue());
     }
 
+    /** Whether a number is one a long holds exactly. */
+    private static boolean fixnum(Number value) {
+        return value instanceof Long || value instanceof Integer
+                || value instanceof Short || value instanceof Byte;
+    }
+
     private static int compare(Number left, Number right) {
+        // A bound and an instance that are both integers are the case that turns
+        // up, and BigDecimal costs two allocations per comparison to answer what
+        // Long.compare answers. Doubles are compared by < and > rather than
+        // Double.compare so that -0.0 and 0.0 stay one number, as they are in
+        // BigDecimal.
+        if (fixnum(left) && fixnum(right)) return Long.compare(left.longValue(), right.longValue());
+        if ((left instanceof Double || left instanceof Float)
+                && (right instanceof Double || right instanceof Float)) {
+            double x = left.doubleValue();
+            double y = right.doubleValue();
+            return x < y ? -1 : (x > y ? 1 : 0);
+        }
         return decimal(left).compareTo(decimal(right));
     }
 
