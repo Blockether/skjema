@@ -46,7 +46,7 @@
             :javac-opts ["--release" "21" "-Xlint:all" "-Werror"]}))
 
 (defn- pom-data []
-  [[:description "Fast JSON Schema 2020-12 validation for Clojure, powered by charred."]
+  [[:description "JSON Schema 2020-12 validation for Clojure."]
    [:url "https://github.com/Blockether/skjema"]
    [:licenses [:license [:name "MIT License"] [:url "https://opensource.org/licenses/MIT"]]]
    [:scm [:url "https://github.com/Blockether/skjema"]

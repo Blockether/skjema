@@ -1,7 +1,6 @@
 # skjema
 
-Fast JSON Schema 2020-12 validation for Clojure. `skjema` is Norwegian for
-*schema*.
+JSON Schema 2020-12 validation for Clojure.
 
 ```clojure
 com.blockether/skjema {:mvn/version "0.2.0"}
@@ -10,12 +9,11 @@ com.blockether/skjema {:mvn/version "0.2.0"}
 ## Use
 
 ```clojure
-(require '[com.blockether.skjema.core :as skjema])
+(require '[com.blockether.skjema.core :as skjema]
+         '[clojure.java.io :as io])
 
-(def schema
-  (skjema/read-schema (java.nio.file.Path/of "user.schema.json" (make-array String 0))))
-
-(def validator (skjema/compile-schema schema))
+(def validator
+  (skjema/compile-schema (skjema/read-schema (io/resource "user.schema.json"))))
 
 (skjema/valid? validator {"name" "Ada"})
 ;; => true
@@ -29,41 +27,32 @@ com.blockether/skjema {:mvn/version "0.2.0"}
 ;;               :error "expected string, got integer"}]}
 ```
 
-`read-schema` accepts JSON text, `Path`, `File`, URL/classpath resource,
-`InputStream`, or `Reader`. `write-schema` returns compact JSON text. Both use
-[charred](https://github.com/cnuernber/charred).
+`read-schema` takes JSON text, a `Path`, a `File`, a URL or classpath resource,
+an `InputStream` or a `Reader`. `write-schema` returns compact JSON text.
 
-Compile once when a schema is reused. References are resolved from an explicit
-registry; skjema never fetches them:
+References resolve from an explicit registry; nothing is fetched over the
+network:
 
 ```clojure
-(def validator
-  (skjema/compile-schema schema
-    {:base "https://example.com/user.json"
-     :registry {"https://example.com/tag.json" tag-schema}
-     :format-assertion true}))
+(skjema/compile-schema schema
+  {:base "https://example.com/user.json"
+   :registry {"https://example.com/tag.json" tag-schema}
+   :format-assertion true})
 ```
 
 ## Errors
 
-`validate` returns JSON Schema BASIC output locations and adds `keyword`,
-keyword-specific `params`, and a human-readable `error`. A successful result is
-`{:valid true}`. Parsing, compilation, and writing throw `ExceptionInfo` with a
-`:skjema/error` category and preserve the original cause.
+`validate` answers `{:valid true}`, or BASIC output locations extended with
+`keyword`, keyword-specific `params` and a readable `error`. Reading, compiling
+and writing throw `ExceptionInfo` carrying a `:skjema/error` category and the
+original cause.
 
-## Verification
-
-The suite covers all required and optional draft 2020-12 cases from the official
-JSON-Schema-Test-Suite. Java owns the compiled validation and IDN hot loops;
-Clojure owns complete evaluation and structured errors.
+## Verify
 
 ```bash
-clojure -M:test
-clojure -M:bench
+clojure -M:test    # official JSON-Schema-Test-Suite, required and optional 2020-12
+clojure -M:bench   # against malli, schema compiled on both sides
 ```
-
-The benchmark prepares both schemas before timing validation. Run it on the
-machine and JVM that matter to your workload.
 
 ## License
 
