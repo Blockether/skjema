@@ -514,7 +514,7 @@
 
 (defmacro ^:private err
   "One structured error. A macro keeps params and prose unbuilt during the
-   allocation-free `valid?` path."
+   allocation-free `validate` path."
   [ctx params message]
   `(let [c# ~ctx]
      (if (:quiet? c#) nope (err* c# ~params ~message))))
@@ -522,7 +522,7 @@
 (defmacro ^:private and-merge
   "Merge the next result into `res`, unless a fail-fast run already knows the
    verdict. An invalid node stays invalid however much more is evaluated under
-   it, so `valid?` stops there; `validate` goes on and collects every error."
+   it, so `validate` stops there; `explain` goes on and collects every error."
   [quiet? res & body]
   `(let [r# ~res]
      (if (and ~quiet? (not (:valid? r#)))
@@ -1266,27 +1266,49 @@
 
 (defn compiled-schema? [x] (boolean (:skjema/compiled x)))
 
-(defn validate
-  "Validate `instance` against a compiled schema (or a raw one, compiled on the
-   spot). Invalid answers preserve JSON Schema BASIC-output locations and add
-   `:keyword` plus keyword-specific `:params`, so a caller can render or act on
-   an error without parsing its human `:error` string. The entire answer is a
-   JSON value."
-  ([schema instance] (validate schema instance nil))
-  ([schema instance opts]
-   (let [c (if (compiled-schema? schema) schema (compile-schema schema opts))
-         r (eval-schema (:ctx c) (:schema c) instance)]
-     (if (:valid? r)
-       {:valid true}
-       {:valid false :errors (vec (:errors r))}))))
+(defn- compiled
+  "The schema as compiled, compiling it first when a caller passed a raw one."
+  [schema opts]
+  (if (compiled-schema? schema) schema (compile-schema schema opts)))
 
-(defn valid?
-  "True when the instance validates. Use `validate` when the reason matters -
-   this asks for the verdict alone, so evaluation stops at the first keyword
-   that refuses and no error is built on the way."
-  ([schema instance] (valid? schema instance nil))
-  ([schema instance opts]
-   (let [c (if (compiled-schema? schema) schema (compile-schema schema opts))]
-     (if-let [^Predicate validator (:fast-validator c)]
-       (.test validator instance)
-       (true? (:valid? (eval-schema (:quiet-ctx c) (:schema c) instance)))))))
+(defn validator
+  "The verdict as a bare function of the instance. It closes over the compiled
+   predicate, so a call reaches it without a map lookup - take this when the same
+   schema validates more than once. Evaluation stops at the first keyword that
+   refuses and no error is built on the way."
+  ([schema] (validator schema nil))
+  ([schema opts]
+   (let [c (compiled schema opts)]
+     (if-let [^Predicate fast (:fast-validator c)]
+       (fn [instance] (.test fast instance))
+       (let [ctx (:quiet-ctx c)
+             schema (:schema c)]
+         (fn [instance] (true? (:valid? (eval-schema ctx schema instance)))))))))
+
+(defn explainer
+  "The reasons as a bare function of the instance: nil when it validates, else
+   JSON Schema BASIC output. The counterpart of `validator` for the same schema."
+  ([schema] (explainer schema nil))
+  ([schema opts]
+   (let [c (compiled schema opts)
+         ctx (:ctx c)
+         schema (:schema c)]
+     (fn [instance]
+       (let [r (eval-schema ctx schema instance)]
+         (when-not (:valid? r)
+           {:valid false :errors (vec (:errors r))}))))))
+
+(defn validate
+  "True when `instance` satisfies the schema. `validator` is the same answer
+   without the per-call dispatch."
+  ([schema instance] (validate schema instance nil))
+  ([schema instance opts] ((validator schema opts) instance)))
+
+(defn explain
+  "Nil when `instance` satisfies the schema, otherwise JSON Schema BASIC output -
+   `{:valid false :errors [...]}` - where every error keeps its instance and
+   keyword locations and adds `:keyword` plus keyword-specific `:params`, so a
+   caller can render or act on it without parsing the human `:error` string. The
+   entire answer is a JSON value."
+  ([schema instance] (explain schema instance nil))
+  ([schema instance opts] ((explainer schema opts) instance)))

@@ -49,7 +49,7 @@
               actual (try
                        (if (instance? Throwable compiled)
                          (throw ^Throwable compiled)
-                         (skjema/valid? compiled (get test-case "data")))
+                         (skjema/validate compiled (get test-case "data")))
                        (catch Throwable e (str "threw: " (.getMessage e))))]
         :when (not= expected actual)]
     {:file (.getName f)
@@ -94,8 +94,8 @@
                test-case (get group "tests")
                :let [instance (get test-case "data")
                      expected (get test-case "valid")
-                     fast (skjema/valid? compiled instance)
-                     complete (skjema/valid? (assoc compiled :fast-validator nil) instance)
+                     fast (skjema/validate compiled instance)
+                     complete (skjema/validate (assoc compiled :fast-validator nil) instance)
                      _ (swap! checked inc)]
                :when (not= expected fast complete)]
            {:file (.getName file)

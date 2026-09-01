@@ -11,7 +11,7 @@
   (let [schema {"$id" "https://example.com/root.json"
                 "$defs" {"number" {"type" "number"}}
                 "properties" {"foo" {"$ref" "#/$defs/number"}}}
-        [error] (:errors (skjema/validate schema {"foo" "not-a-number"}))]
+        [error] (:errors (skjema/explain schema {"foo" "not-a-number"}))]
     (is (= {:instanceLocation "/foo"
             :keywordLocation "/properties/foo/$ref/type"
             :absoluteKeywordLocation "https://example.com/root.json#/$defs/number/type"
@@ -26,7 +26,7 @@
   ;; the object that owns it.
   (let [schema {"properties" {"foo" {} "bar" {}}
                 "additionalProperties" false}
-        errors (:errors (skjema/validate schema {"foo" 1 "bar" 2 "baz" 3 "quux" 4}))]
+        errors (:errors (skjema/explain schema {"foo" 1 "bar" 2 "baz" 3 "quux" 4}))]
     (is (= [{:instanceLocation ""
              :keywordLocation "/additionalProperties"
              :keyword "additionalProperties"
@@ -42,7 +42,7 @@
 (deftest required-names-one-missing-property-per-error
   ;; Adapted from Ajv errors.spec.ts: every missing member is independently
   ;; actionable, rather than hidden inside one sentence callers must parse.
-  (let [errors (:errors (skjema/validate {"required" ["foo" "bar" "baz"]} {"foo" 1}))]
+  (let [errors (:errors (skjema/explain {"required" ["foo" "bar" "baz"]} {"foo" 1}))]
     (is (= [{:instanceLocation ""
              :keywordLocation "/required"
              :keyword "required"
@@ -58,18 +58,18 @@
 (deftest one-of-reports-the-branches-that-passed
   ;; Adapted from Ajv errors.spec.ts.
   (let [schema {"oneOf" [{"type" "number"} {"type" "integer"} {"const" 1.5}]}
-        [integer-error] (:errors (skjema/validate schema 1))
-        [decimal-error] (:errors (skjema/validate schema 1.5))]
+        [integer-error] (:errors (skjema/explain schema 1))
+        [decimal-error] (:errors (skjema/explain schema 1.5))]
     (is (= {:passingSchemas [0 1]} (:params integer-error)))
     (is (= {:passingSchemas [0 2]} (:params decimal-error)))
     (is (= "oneOf" (:keyword integer-error)))))
 
 (deftest limits-and-duplicates-carry-values-a-ui-can-render
   (testing "numeric and size limits"
-    (let [errors (:errors (skjema/validate {"maxLength" 3} "long"))]
+    (let [errors (:errors (skjema/explain {"maxLength" 3} "long"))]
       (is (= {:limit 3 :actual 4} (:params (first errors))))))
   (testing "duplicate array positions"
-    (let [[error] (:errors (skjema/validate {"uniqueItems" true} ["a" "b" "a"]))]
+    (let [[error] (:errors (skjema/explain {"uniqueItems" true} ["a" "b" "a"]))]
       (is (= "uniqueItems" (:keyword error)))
       (is (= {:i 2 :j 0} (:params error))))))
 
@@ -77,7 +77,7 @@
   ;; Adapted from Ajv errors.spec.ts.
   (let [schema {"$schema" "http://json-schema.org/draft-07/schema#"
                 "dependencies" {"a" ["foo" "bar"]}}
-        errors (:errors (skjema/validate schema {"a" 0}))]
+        errors (:errors (skjema/explain schema {"a" 0}))]
     (is (= [{:property "a"
              :missingProperty "foo"
              :deps "foo, bar"
@@ -90,7 +90,7 @@
     (is (= ["dependencies" "dependencies"] (mapv :keyword errors)))))
 
 (deftest structured-errors-remain-json-values
-  (let [answer (-> (skjema/validate {"required" ["name"]} {})
+  (let [answer (-> (skjema/explain {"required" ["name"]} {})
                    skjema/write-schema
                    skjema/read-schema)]
     (is (= {"valid" false

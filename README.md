@@ -3,7 +3,7 @@
 JSON Schema 2020-12 validation for Clojure.
 
 ```clojure
-com.blockether/skjema {:mvn/version "0.2.0"}
+com.blockether/skjema {:mvn/version "0.3.0"}
 ```
 
 ## Use
@@ -12,19 +12,30 @@ com.blockether/skjema {:mvn/version "0.2.0"}
 (require '[com.blockether.skjema.core :as skjema]
          '[clojure.java.io :as io])
 
-(def validator
-  (skjema/compile-schema (skjema/read-schema (io/resource "user.schema.json"))))
+(def schema
+  (skjema/read-schema (io/resource "user.schema.json")))
 
-(skjema/valid? validator {"name" "Ada"})
+(skjema/validate schema {"name" "Ada"})
 ;; => true
 
-(skjema/validate validator {"name" 42})
+(skjema/explain schema {"name" 42})
 ;; => {:valid false
 ;;     :errors [{:instanceLocation "/name"
 ;;               :keywordLocation "/properties/name/type"
 ;;               :keyword "type"
 ;;               :params {:type "string"}
 ;;               :error "expected string, got integer"}]}
+```
+
+Compile once and keep the function when the same schema validates repeatedly -
+that is the fast path, and it is what the benchmark measures:
+
+```clojure
+(def valid? (skjema/validator schema))
+(def why (skjema/explainer schema))
+
+(valid? {"name" "Ada"})   ;; => true
+(why {"name" "Ada"})      ;; => nil
 ```
 
 `read-schema` takes JSON text, a `Path`, a `File`, a URL or classpath resource,
@@ -42,10 +53,10 @@ network:
 
 ## Errors
 
-`validate` answers `{:valid true}`, or BASIC output locations extended with
-`keyword`, keyword-specific `params` and a readable `error`. Reading, compiling
-and writing throw `ExceptionInfo` carrying a `:skjema/error` category and the
-original cause.
+`explain` answers nil, or BASIC output locations extended with `keyword`,
+keyword-specific `params` and a readable `error`. Reading, compiling and writing
+throw `ExceptionInfo` carrying a `:skjema/error` category and the original
+cause.
 
 ## Verify
 

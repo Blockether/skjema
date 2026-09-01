@@ -14,11 +14,24 @@
    "$defs" {"tag" {"type" "string"}}})
 
 (deftest a-valid-instance-answers-nothing-else
-  (is (= {:valid true} (skjema/validate user-schema {"name" "ada" "tags" ["one"]})))
-  (is (true? (skjema/valid? user-schema {"name" "ada"}))))
+  (is (nil? (skjema/explain user-schema {"name" "ada" "tags" ["one"]})))
+  (is (true? (skjema/validate user-schema {"name" "ada"}))))
+
+(deftest a-prepared-function-answers-what-the-call-answers
+  (let [compiled (skjema/compile-schema user-schema)
+        valid? (skjema/validator compiled)
+        why (skjema/explainer compiled)]
+    (is (true? (valid? {"name" "ada"})))
+    (is (false? (valid? {"name" "ab"})))
+    (is (nil? (why {"name" "ada"})))
+    (is (= (skjema/explain compiled {"name" "ab"}) (why {"name" "ab"})))
+    (testing "and it prepares a raw schema itself, options and all"
+      (is (false? ((skjema/validator {"type" "string" "format" "ipv4"}
+                                     {:format-assertion true})
+                   "not-an-address"))))))
 
 (deftest every-error-says-where-it-happened
-  (let [{:keys [valid errors]} (skjema/validate user-schema {"name" "ab" "tags" ["ok" 7]})]
+  (let [{:keys [valid errors]} (skjema/explain user-schema {"name" "ab" "tags" ["ok" 7]})]
     (is (false? valid))
     (is (= 2 (count errors)))
     (testing "the instance location is a JSON pointer into the instance"
@@ -43,26 +56,26 @@
                      "params" {"missingProperty" "name"}
                      "absoluteKeywordLocation" "https://example.com/user.json#/required"
                      "error" "missing required property \"name\""}]}
-         (skjema/read-schema (skjema/write-schema (skjema/validate user-schema {}))))))
+         (skjema/read-schema (skjema/write-schema (skjema/explain user-schema {}))))))
 
 (deftest a-schema-without-an-identifier-has-no-absolute-location
-  (let [[error] (:errors (skjema/validate {"type" "integer"} "no"))]
+  (let [[error] (:errors (skjema/explain {"type" "integer"} "no"))]
     (is (= "" (:instanceLocation error)))
     (is (= "/type" (:keywordLocation error)))
     (is (not (contains? error :absoluteKeywordLocation)))))
 
 (deftest format-annotates-until-it-is-asked-to-assert
   (let [schema {"type" "string" "format" "ipv4"}]
-    (is (true? (skjema/valid? schema "not-an-address")))
-    (is (false? (skjema/valid? schema "not-an-address" {:format-assertion true})))
-    (is (true? (skjema/valid? schema "127.0.0.1" {:format-assertion true})))
+    (is (true? (skjema/validate schema "not-an-address")))
+    (is (false? (skjema/validate schema "not-an-address" {:format-assertion true})))
+    (is (true? (skjema/validate schema "127.0.0.1" {:format-assertion true})))
     (testing "a format this library does not know asserts nothing at all"
-      (is (true? (skjema/valid? {"format" "sort-code"} "anything" {:format-assertion true}))))
+      (is (true? (skjema/validate {"format" "sort-code"} "anything" {:format-assertion true}))))
     (testing "and the failure reads like every other error"
       (is (= [{:instanceLocation "" :keywordLocation "/format"
                :keyword "format" :params {:format "ipv4"}
                :error "the string is not a valid ipv4"}]
-             (:errors (skjema/validate schema "not-an-address" {:format-assertion true})))))))
+             (:errors (skjema/explain schema "not-an-address" {:format-assertion true})))))))
 
 (deftest the-format-assertion-vocabulary-asks-on-the-schemas-behalf
   (let [meta-schema {"$id" "https://example.com/format-meta"
@@ -74,16 +87,16 @@
                 "format" "ipv4"}
         compiled (skjema/compile-schema schema {:registry {"https://example.com/format-meta" meta-schema}})]
     (testing "declaring the vocabulary is the request; the boolean beside it only speaks to implementations without it"
-      (is (false? (skjema/valid? compiled "not-an-address")))
-      (is (true? (skjema/valid? compiled "127.0.0.1"))))))
+      (is (false? (skjema/validate compiled "not-an-address")))
+      (is (true? (skjema/validate compiled "127.0.0.1"))))))
 
 (deftest dependencies-still-mean-what-they-meant
   (let [schema {"dependencies" {"card" ["billing"]
                                 "billing" {"required" ["postcode"]}}}]
-    (is (true? (skjema/valid? schema {})))
-    (is (false? (skjema/valid? schema {"card" 1})))
-    (is (false? (skjema/valid? schema {"billing" 1})))
-    (is (true? (skjema/valid? schema {"card" 1 "billing" 1 "postcode" "SW1"})))))
+    (is (true? (skjema/validate schema {})))
+    (is (false? (skjema/validate schema {"card" 1})))
+    (is (false? (skjema/validate schema {"billing" 1})))
+    (is (true? (skjema/validate schema {"card" 1 "billing" 1 "postcode" "SW1"})))))
 
 (deftest a-resource-is-read-as-the-draft-it-declares
   (let [older {"$id" "https://example.com/2019.json"
@@ -93,10 +106,10 @@
                 "type" "array"
                 "$ref" "https://example.com/2019.json"}]
     (testing "2019-09 has no `prefixItems`, so a reference into one finds an annotation"
-      (is (true? (skjema/valid? schema [1 2 3]
-                                {:registry {"https://example.com/2019.json" older}}))))
+      (is (true? (skjema/validate schema [1 2 3]
+                                  {:registry {"https://example.com/2019.json" older}}))))
     (testing "while the same schema in 2020-12 asserts"
-      (is (false? (skjema/valid?
+      (is (false? (skjema/validate
                    (assoc older "$schema" "https://json-schema.org/draft/2020-12/schema")
                    [1 2 3]))))))
 
@@ -104,9 +117,9 @@
   (let [schema {"$schema" "http://json-schema.org/draft-07/schema#"
                 "items" [{"type" "string"} {"type" "number"}]
                 "additionalItems" {"type" "boolean"}}]
-    (is (true? (skjema/valid? schema ["a" 1 true])))
-    (is (false? (skjema/valid? schema [1])))
-    (is (false? (skjema/valid? schema ["a" 1 "and one too many"])))))
+    (is (true? (skjema/validate schema ["a" 1 true])))
+    (is (false? (skjema/validate schema [1])))
+    (is (false? (skjema/validate schema ["a" 1 "and one too many"])))))
 
 (deftest malformed-schemas-fail-at-compilation-with-actionable-data
   (doseq [[schema location] [[{"type" "mystery"} "/type"]
@@ -132,5 +145,5 @@
     (let [compiled (skjema/compile-schema schema)
           complete (assoc compiled :fast-validator nil)]
       (doseq [instance instances]
-        (is (= (skjema/valid? complete instance)
-               (skjema/valid? compiled instance)))))))
+        (is (= (skjema/validate complete instance)
+               (skjema/validate compiled instance)))))))
