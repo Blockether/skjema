@@ -507,6 +507,7 @@ public final class Fast {
         private final long min;
         private final long max;
         private final String[] required;
+        private final boolean[] mandatory;
         private final Object[] names;
         private final Node[] nodes;
         private final Set<Object> declared;
@@ -519,12 +520,12 @@ public final class Fast {
                    Map<Object, String[]> dependentRequired, boolean hasAdditional, Node additional) {
             this.min = min;
             this.max = max;
-            this.required = required;
             this.hasAdditional = hasAdditional;
             this.additional = additional;
             int count = properties == null ? 0 : properties.size();
             this.names = count == 0 ? null : new Object[count];
             this.nodes = count == 0 ? null : new Node[count];
+            this.mandatory = count == 0 ? null : new boolean[count];
             if (count > 0) {
                 int i = 0;
                 for (Map.Entry<Object, Node> entry : properties.entrySet()) {
@@ -533,6 +534,28 @@ public final class Fast {
                     i++;
                 }
             }
+            // A required name that `properties` also declares is answered by the one
+            // lookup that check already makes, so only the names without a declared
+            // property are left to a pass of their own.
+            String[] outstanding = required;
+            if (required != null && count > 0) {
+                boolean[] covered = new boolean[required.length];
+                int rest = required.length;
+                for (int i = 0; i < names.length; i++) {
+                    for (int r = 0; r < required.length; r++) {
+                        if (!covered[r] && required[r].equals(names[i])) {
+                            covered[r] = true;
+                            mandatory[i] = true;
+                            rest--;
+                        }
+                    }
+                }
+                outstanding = rest == 0 ? null : new String[rest];
+                for (int r = 0, j = 0; outstanding != null && r < required.length; r++) {
+                    if (!covered[r]) outstanding[j++] = required[r];
+                }
+            }
+            this.required = outstanding;
             this.declared = hasAdditional && properties != null ? new HashSet<>(properties.keySet()) : null;
             int dependents = dependentRequired == null ? 0 : dependentRequired.size();
             this.dependentOn = dependents == 0 ? null : new Object[dependents];
@@ -563,7 +586,9 @@ public final class Fast {
             if (names != null) {
                 for (int i = 0; i < names.length; i++) {
                     Object member = lookup(object, names[i]);
-                    if (member != MISSING && !nodes[i].valid(member)) return false;
+                    if (member == MISSING) {
+                        if (mandatory[i]) return false;
+                    } else if (!nodes[i].valid(member)) return false;
                 }
             }
             if (hasAdditional) {
