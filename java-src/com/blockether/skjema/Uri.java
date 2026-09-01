@@ -84,7 +84,9 @@ public final class Uri {
 
     /**
      * Decode {@code %XX} escapes as UTF-8. A pointer fragment is part of a URI,
-     * so {@code /foo%20bar} and {@code /foo bar} name the same member.
+     * so {@code /foo%20bar} and {@code /foo bar} name the same member. A
+     * {@code %} that begins no complete escape is the character itself: a
+     * malformed reference is one that resolves to nothing, not one that throws.
      */
     public static String percentDecode(String s) {
         int escape = s.indexOf('%');
@@ -94,8 +96,9 @@ public final class Uri {
         int i = 0;
         while (i < n) {
             char c = s.charAt(i);
-            if (c == '%' && i + 3 <= n) {
-                out.write(Integer.parseInt(s.substring(i + 1, i + 3), 16));
+            int octet = c == '%' && i + 3 <= n ? octet(s.charAt(i + 1), s.charAt(i + 2)) : -1;
+            if (octet >= 0) {
+                out.write(octet);
                 i += 3;
             } else {
                 byte[] utf8 = String.valueOf(c).getBytes(StandardCharsets.UTF_8);
@@ -104,6 +107,20 @@ public final class Uri {
             }
         }
         return out.toString(StandardCharsets.UTF_8);
+    }
+
+    /** The octet two escape characters spell, or -1 where either is not an ASCII hexadecimal digit. */
+    private static int octet(char high, char low) {
+        int hi = hexDigit(high);
+        int lo = hexDigit(low);
+        return hi < 0 || lo < 0 ? -1 : (hi << 4) | lo;
+    }
+
+    private static int hexDigit(char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
     }
 
     /**

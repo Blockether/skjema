@@ -831,7 +831,13 @@ public final class Schemas {
                 || value instanceof Long || value instanceof BigInteger || value instanceof clojure.lang.BigInt;
     }
 
-    private static BigDecimal decimal(Number value) {
+    /**
+     * One number as the BigDecimal that compares it. Total where {@code bigdec}
+     * is not: a Clojure ratio with no terminating expansion is rounded to
+     * DECIMAL128 rather than refused, and the walking evaluator calls this same
+     * method so that neither path can answer differently.
+     */
+    public static BigDecimal decimal(Number value) {
         if (value instanceof BigDecimal decimal) return decimal;
         if (value instanceof BigInteger integer) return new BigDecimal(integer);
         if (value instanceof clojure.lang.BigInt integer) return new BigDecimal(integer.toBigInteger());
@@ -864,7 +870,8 @@ public final class Schemas {
         return decimal(left).compareTo(decimal(right));
     }
 
-    private static boolean multipleOf(Number value, Number divisor) {
+    /** Whether {@code value} is a multiple of {@code divisor}; the definition both evaluators use. */
+    public static boolean multipleOf(Number value, Number divisor) {
         try {
             BigDecimal d = decimal(divisor);
             return d.signum() != 0 && decimal(value).remainder(d).signum() == 0;
@@ -887,8 +894,18 @@ public final class Schemas {
         public int hashCode() { return Util.hasheq(value); }
     }
 
+    /**
+     * A NaN or an infinity as the key equality compares. It has no JSON
+     * spelling and no BigDecimal, so it answers its own name: two of them are
+     * one value, and no number and no string is that value.
+     */
+    private record NonJson(String name) {
+    }
+
     private static Object canonical(Object value) {
-        if (value instanceof Number number && jsonNumber(number)) return new NumberKey(number);
+        if (value instanceof Number number) {
+            return jsonNumber(number) ? new NumberKey(number) : new NonJson(number.toString());
+        }
         if (value instanceof Map<?, ?> map) {
             HashMap<Object, Object> result = new HashMap<>(map.size() * 2);
             for (Map.Entry<?, ?> entry : map.entrySet()) result.put(entry.getKey(), canonical(entry.getValue()));

@@ -56,15 +56,34 @@
                         t))))))
 
 (defn- json-str
-  "Compact JSON text for a value lifted out of a schema into an error message."
+  "Compact JSON text for a value lifted out of a schema into an error message.
+   A schema read from EDN can hold a value JSON has no spelling for - a NaN, an
+   infinity - and a message about that value is no place to refuse it."
   ^String [value]
-  (charred/write-json-str value :escape-unicode false :escape-slash false))
+  (try
+    (charred/write-json-str value :escape-unicode false :escape-slash false)
+    (catch Exception _ (pr-str value))))
 
 (def ^:private ^:const max-eval-depth
   "A cyclic self-reference can recurse without the instance ever shrinking.
    Data-driven recursion terminates on its own; this bound turns a pathological
-   schema into an error a caller can catch."
-  2048)
+   schema into an error a caller can catch. It sits far below the depth a JVM
+   stack survives - measured, the thread dies near 320 nested references - so
+   the answer is this error and not a killed thread."
+  128)
+
+(defmacro ^:private bounded
+  "Evaluate `body`, answering the recursion error instead of dying of a stack
+   overflow. `max-eval-depth` catches the reference chain that never ends; this
+   catches the rest of what costs stack - schema nesting, instance nesting, a
+   deeply nested constant - which no counter on the way down can see. Measured
+   free on the compiled predicate, whose cost is unchanged either way."
+  [& body]
+  `(try
+     ~@body
+     (catch StackOverflowError _#
+       (throw (ex-info "nesting is too deep to evaluate"
+                       {:skjema/error :schema/recursion})))))
 
 (defrecord Ctx
            ;; `keyword` is a declared FIELD because every descent sets it: a key the
@@ -141,7 +160,12 @@
   [x]
   (cond
     (instance? Boolean x) x
-    (json-number? x) [::number (.stripTrailingZeros (bigdec x))]
+    (json-number? x) [::number (.stripTrailingZeros (Schemas/decimal ^Number x))]
+    ;; A NaN or an infinity reaches a schema through EDN and has no JSON
+    ;; spelling and no BigDecimal, so it answers its own name: two of them are
+    ;; one value, and no JSON number is that value. The compiled validator
+    ;; compares them the same way.
+    (number? x) [::non-json (str x)]
     (map? x) (persistent! (reduce-kv (fn [m k v] (assoc! m k (canonical v))) (transient {}) x))
     (sequential? x) (mapv canonical x)
     :else x))
@@ -160,7 +184,10 @@
     (let [x (double a) y (double b)]
       (cond (< x y) -1 (> x y) 1 :else 0))
 
-    :else (long (.compareTo (bigdec a) (bigdec b)))))
+    ;; `Schemas/decimal` and not `bigdec`, which throws on the ratio EDN can
+    ;; hand a schema and JSON cannot: the compiled validator compares through
+    ;; that same method, so the two paths cannot answer differently.
+    :else (long (.compareTo (Schemas/decimal ^Number a) (Schemas/decimal ^Number b)))))
 
 (defn- json-equal?
   "JSON equality: numbers by VALUE, everything else structurally. Scalars are
@@ -176,13 +203,10 @@
     (or (string? a) (string? b) (json-number? a) (json-number? b)) false
     :else (= (canonical a) (canonical b))))
 
-(defn- multiple-of? [x divisor]
-  (let [^BigDecimal bx (bigdec x)
-        ^BigDecimal bd (bigdec divisor)]
-    (and (not (zero? (.signum bd)))
-         (try
-           (zero? (.compareTo BigDecimal/ZERO (.remainder bx bd)))
-           (catch ArithmeticException _ false)))))
+(defn- multiple-of? [^Number x ^Number divisor]
+  ;; One definition of what a multiple is, shared with the compiled validator:
+  ;; neither path can answer differently, and neither throws on a ratio.
+  (Schemas/multipleOf x divisor))
 
 (defn- code-point-count ^long [^String s]
   (.codePointCount s 0 (.length s)))
@@ -421,7 +445,12 @@
                     :else acc))
                 x
                 x)]
-      (if-let [p (Schemas/compileValidator node)]
+      (if-let [p (try
+                   (Schemas/compileValidator node)
+                   ;; An unparseable `pattern` is a schema error that names a
+                   ;; location, and only `index-schema` knows the location.
+                   ;; Refusing the node here is what leaves it to say so.
+                   (catch java.util.regex.PatternSyntaxException _ nil))]
         (vary-meta node assoc ::compiled p)
         node))))
 (defn- compile-pattern! [location pattern]
@@ -1875,64 +1904,65 @@
    documents are resolved only from the supplied registry."
   ([schema] (compile-schema schema nil))
   ([schema opts]
-   (let [base (Uri/stripFragment (or (:base opts) ""))
-         registry (update-vals (merge @bundled-meta-schemas (:registry opts)) with-masks)
-         acc (reduce-kv (fn [acc uri doc]
-                          (-> acc
-                              (assoc-in [:index uri] {:schema doc :base uri :ptr ""})
-                              (index-schema doc uri "")))
-                        {:index {} :dynamic {}}
-                        registry)
-         schema (with-masks schema)
+   (bounded
+    (let [base (Uri/stripFragment (or (:base opts) ""))
+          registry (update-vals (merge @bundled-meta-schemas (:registry opts)) with-masks)
+          acc (reduce-kv (fn [acc uri doc]
+                           (-> acc
+                               (assoc-in [:index uri] {:schema doc :base uri :ptr ""})
+                               (index-schema doc uri "")))
+                         {:index {} :dynamic {}}
+                         registry)
+          schema (with-masks schema)
          ;; The fast compiler reads 2020-12 as written. A document that declares
          ;; another dialect is evaluated through a legacy view it never sees, and
          ;; a registry or an asserting `format` is beyond it, so those documents
          ;; stay with the complete evaluator.
-         fast? (and (not (:format-assertion opts))
-                    (empty? (:registry opts))
-                    (contains? #{nil official-meta-schema}
-                               (when (map? schema) (get schema "$schema"))))
-         schema (if fast? (with-fast schema) schema)
-         acc (index-schema acc schema base "")
-         root-base (if (and (map? schema) (string? (get schema "$id")))
-                     (Uri/stripFragment (Uri/resolveRef base (get schema "$id")))
-                     base)
-         acc (update acc :index #(assoc % base {:schema schema :base root-base :ptr ""}
-                                        root-base {:schema schema :base root-base :ptr ""}))
-         c {:skjema/compiled true
-            :schema schema
-            :base root-base
-            :index (:index acc)
-            :dynamic (:dynamic acc)
+          fast? (and (not (:format-assertion opts))
+                     (empty? (:registry opts))
+                     (contains? #{nil official-meta-schema}
+                                (when (map? schema) (get schema "$schema"))))
+          schema (if fast? (with-fast schema) schema)
+          acc (index-schema acc schema base "")
+          root-base (if (and (map? schema) (string? (get schema "$id")))
+                      (Uri/stripFragment (Uri/resolveRef base (get schema "$id")))
+                      base)
+          acc (update acc :index #(assoc % base {:schema schema :base root-base :ptr ""}
+                                         root-base {:schema schema :base root-base :ptr ""}))
+          c {:skjema/compiled true
+             :schema schema
+             :base root-base
+             :index (:index acc)
+             :dynamic (:dynamic acc)
               ;; Annotations exist for `unevaluatedProperties` and
               ;; `unevaluatedItems`. A document that never mentions them has
               ;; nothing to spend a set of evaluated member names on, so none
               ;; is built.
-            :annotate? (boolean (:unevaluated? acc))
+             :annotate? (boolean (:unevaluated? acc))
               ;; `$ref` resolution is string work against a fixed index: the
               ;; same handful of answers, once per compiled schema instead of
               ;; once per instance.
-            :ref-cache (atom {})
-            :format-assertion (boolean (:format-assertion opts))}
-         compiled (assoc c
-                         :ctx (eval-ctx c false)
-                         :quiet-ctx (eval-ctx c true)
-                         :fast-explainer (when (and fast? (str/blank? base))
-                                           (compiled-explainer schema)))
-         meta-uri (when (map? schema) (or (get schema "$schema") official-meta-schema))
-         target (when (= official-meta-schema meta-uri)
-                  (get-in compiled [:index meta-uri]))
-         checked (when target
-                   (eval-schema (-> (:ctx compiled) (enter target)) (:schema target) schema))]
-     (when (and checked (not (:valid? checked)))
-       (let [errors (vec (:errors checked))
-             first-error (or (first (remove #(#{"allOf" "anyOf" "oneOf"} (:keyword %)) errors))
-                             (first errors))]
-         (throw (ex-info (str "invalid JSON Schema at "
-                              (or (not-empty (:instanceLocation first-error)) "/")
-                              ": " (:error first-error))
-                         {:skjema/error :schema/invalid :errors errors}))))
-     (assoc compiled :fast-validator (::compiled (meta schema))))))
+             :ref-cache (atom {})
+             :format-assertion (boolean (:format-assertion opts))}
+          compiled (assoc c
+                          :ctx (eval-ctx c false)
+                          :quiet-ctx (eval-ctx c true)
+                          :fast-explainer (when (and fast? (str/blank? base))
+                                            (compiled-explainer schema)))
+          meta-uri (when (map? schema) (or (get schema "$schema") official-meta-schema))
+          target (when (= official-meta-schema meta-uri)
+                   (get-in compiled [:index meta-uri]))
+          checked (when target
+                    (eval-schema (-> (:ctx compiled) (enter target)) (:schema target) schema))]
+      (when (and checked (not (:valid? checked)))
+        (let [errors (vec (:errors checked))
+              first-error (or (first (remove #(#{"allOf" "anyOf" "oneOf"} (:keyword %)) errors))
+                              (first errors))]
+          (throw (ex-info (str "invalid JSON Schema at "
+                               (or (not-empty (:instanceLocation first-error)) "/")
+                               ": " (:error first-error))
+                          {:skjema/error :schema/invalid :errors errors}))))
+      (assoc compiled :fast-validator (::compiled (meta schema)))))))
 
 (defn compiled-schema? [x] (boolean (:skjema/compiled x)))
 
@@ -1950,10 +1980,10 @@
   ([schema opts]
    (let [c (compiled schema opts)]
      (if-let [^Predicate fast (:fast-validator c)]
-       (fn [instance] (.test fast instance))
+       (fn [instance] (bounded (.test fast instance)))
        (let [ctx (:quiet-ctx c)
              schema (:schema c)]
-         (fn [instance] (true? (:valid? (eval-schema ctx schema instance)))))))))
+         (fn [instance] (bounded (true? (:valid? (eval-schema ctx schema instance))))))))))
 
 (defn explainer
   "The reasons as a bare function of the instance: nil when it validates, else
@@ -1969,16 +1999,18 @@
         ;; compiled predicate answers it, and only an instance that has something
         ;; to explain pays for the errors it has.
        (if-let [explain-fast (:fast-explainer c)]
-         explain-fast
+         (fn [instance] (bounded (explain-fast instance)))
          (fn [instance]
-           (when-not (.test fast instance)
-             (let [r (eval-schema ctx schema instance true)]
-               (when-not (:valid? r)
-                 (report (:errors r)))))))
+           (bounded
+            (when-not (.test fast instance)
+              (let [r (eval-schema ctx schema instance true)]
+                (when-not (:valid? r)
+                  (report (:errors r))))))))
        (fn [instance]
-         (let [r (eval-schema ctx schema instance)]
-           (when-not (:valid? r)
-             (report (:errors r)))))))))
+         (bounded
+          (let [r (eval-schema ctx schema instance)]
+            (when-not (:valid? r)
+              (report (:errors r))))))))))
 
 (defn validate
   "True when `instance` satisfies the schema. `validator` is the same answer
