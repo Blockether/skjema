@@ -3,7 +3,7 @@
 JSON Schema 2020-12 validation for Clojure.
 
 ```clojure
-com.blockether/skjema {:mvn/version "0.3.0"}
+com.blockether/skjema {:mvn/version "0.3.1"}
 ```
 
 ## Use
@@ -41,7 +41,7 @@ that is the fast path, and it is what the benchmark measures:
 
 ## API
 
-Seven vars in `com.blockether.skjema.core`, and that is the whole surface.
+Seven calls in `com.blockether.skjema.core`, and that is the whole surface.
 Instances and schemas are plain data with JSON string keys.
 
 | call | answers |
@@ -73,8 +73,9 @@ assertion.
 ## Verify
 
 ```bash
-clojure -M:test    # official JSON-Schema-Test-Suite, required and optional 2020-12
-clojure -M:bench   # against malli, schema compiled on both sides
+clojure -T:build compile-java   # the Java sources, once per checkout
+clojure -M:test                 # official JSON-Schema-Test-Suite, required and optional 2020-12
+clojure -M:bench                # against malli, schema compiled on both sides
 ```
 
 ## License
