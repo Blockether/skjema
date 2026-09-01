@@ -11,53 +11,14 @@
    rather than delegated: `java.net.URI` is RFC 2396 and accepts what RFC 3986
    refuses, `InetAddress` resolves names, and `DateTimeFormatter` has no
    opinion about a leap second, which RFC 3339 permits at exactly one instant
-   of the day."
+   of the day. The grammars that are a plain walk over the characters - the
+   dates, times, durations, UUIDs and addresses - are walked in
+   `Formats.java`, because a format is asserted once per instance and a
+   regular expression that allocates its groups is the wrong tool there."
   (:require [clojure.string :as str]
             [com.blockether.skjema.idn :as idn]
             [com.blockether.skjema.regex :as regex])
-  (:import (java.time LocalDate)))
-
-;; Dates, times and durations (RFC 3339)
-
-(def ^:private date-pattern #"(\d{4})-(\d{2})-(\d{2})")
-
-(defn- date?
-  [^String s]
-  (boolean
-   (when-let [[_ y m d] (re-matches date-pattern s)]
-     (try (LocalDate/of (parse-long y) (parse-long m) (parse-long d)) true
-          (catch Exception _ false)))))
-
-(def ^:private time-pattern
-  #"(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|([+-])(\d{2}):(\d{2}))")
-
-(defn- time?
-  "RFC 3339 full-time: the offset is not optional, and the leap second is only
-   a second of the day if it is the LAST one - 23:59:60 in UTC, whatever the
-   offset spells it as locally."
-  [^String s]
-  (boolean
-   (when-let [[_ h m sec sign oh om] (re-matches time-pattern s)]
-     (let [h (long (parse-long h)) m (long (parse-long m)) sec (long (parse-long sec))
-           oh (some-> oh parse-long) om (some-> om parse-long)
-           offset (long (if sign (* (if (= sign "-") -1 1) (+ (* 60 (long oh)) (long om))) 0))]
-       (and (<= h 23) (<= m 59)
-            (or (nil? oh) (and (<= (long oh) 23) (<= (long om) 59)))
-            (if (= sec 60)
-              (= 1439 (mod (- (+ (* 60 h) m) offset) 1440))
-              (<= sec 59)))))))
-
-(defn- date-time?
-  [^String s]
-  (and (> (count s) 11)
-       (contains? #{\T \t} (.charAt s 10))
-       (date? (subs s 0 10))
-       (time? (subs s 11))))
-
-(def ^:private duration-pattern
-  #"P(?:\d+W|(?:\d+Y(?:\d+M(?:\d+D)?)?|\d+M(?:\d+D)?|\d+D)(?:T(?:\d+H(?:\d+M(?:\d+S)?)?|\d+M(?:\d+S)?|\d+S))?|T(?:\d+H(?:\d+M(?:\d+S)?)?|\d+M(?:\d+S)?|\d+S))")
-
-(defn- duration? [^String s] (boolean (re-matches duration-pattern s)))
+  (:import (com.blockether.skjema Formats)))
 
 ;; Hosts and addresses
 
@@ -65,13 +26,8 @@
   "RFC 1123, and an `xn--` label still has to be Punycode that decodes: a host
    name is the ASCII half of an internationalized one, not a looser grammar."
   [^String s]
-  (and (every? #(< (int %) 128) s)
+  (and (Formats/ascii s)
        (idn/hostname? s)))
-
-(def ^:private ipv4-pattern
-  #"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}")
-
-(defn- ipv4? [^String s] (boolean (re-matches ipv4-pattern s)))
 
 (def ^:private ipv6-pattern
   (let [h16 "[0-9A-Fa-f]{1,4}"
@@ -167,7 +123,7 @@
        (let [body (subs domain 1 (dec (count domain)))]
          (if (str/starts-with? (str/lower-case body) "ipv6:")
            (ipv6? (subs body 5))
-           (ipv4? body)))))
+           (Formats/ipv4 body)))))
 
 (defn- email? [^String s]
   (let [at (.lastIndexOf s "@")]
@@ -190,27 +146,24 @@
 (def ^:private relative-json-pointer-pattern
   #"(?:0|[1-9][0-9]*)(?:#|(?:/(?:[^~/]|~[01])*)*)")
 
-(def ^:private uuid-pattern
-  #"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
-
 (def ^:private checks
   "Every format 2020-12 defines, and the question each one asks."
-  {"date" date?
-   "date-time" date-time?
-   "time" time?
-   "duration" duration?
+  {"date" #(Formats/date %)
+   "date-time" #(Formats/dateTime %)
+   "time" #(Formats/time %)
+   "duration" #(Formats/duration %)
    "email" email?
    "idn-email" idn-email?
    "hostname" hostname?
    "idn-hostname" idn/hostname?
-   "ipv4" ipv4?
+   "ipv4" #(Formats/ipv4 %)
    "ipv6" ipv6?
    "uri" #(boolean (re-matches (:absolute @uri-forms) %))
    "uri-reference" #(boolean (re-matches (:reference @uri-forms) %))
    "iri" #(boolean (re-matches (:absolute @iri-forms) %))
    "iri-reference" #(boolean (re-matches (:reference @iri-forms) %))
    "uri-template" #(boolean (re-matches @uri-template-pattern %))
-   "uuid" #(boolean (re-matches uuid-pattern %))
+   "uuid" #(Formats/uuid %)
    "json-pointer" #(boolean (re-matches json-pointer-pattern %))
    "relative-json-pointer" #(boolean (re-matches relative-json-pointer-pattern %))
    "regex" regex/ecma?})

@@ -70,19 +70,6 @@ References resolve from that registry alone; nothing is fetched over the
 network. `:format-assertion` turns `format` from an annotation into an
 assertion.
 
-## Errors
-
-**`compile-schema` is where a schema is checked.** It validates the document
-against the bundled 2020-12 meta-schema and throws `ExceptionInfo` carrying
-`:skjema/error :schema/invalid` and the BASIC `:errors` of the schema itself.
-`read-schema` only parses JSON, and fails with `:schema/read`.
-
-`explain` answers nil, or BASIC output locations extended with `keyword`,
-keyword-specific `params` and a readable `error`. The whole answer is a JSON
-value, so any JSON writer can render it, and it carries **the first five errors**
-of the instance - a reader acts on those, and the rest only cost the walk that
-would find them.
-
 ## Verify
 
 ```bash
