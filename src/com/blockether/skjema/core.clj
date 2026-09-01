@@ -480,6 +480,15 @@
     r
     (assoc r :props #{} :items #{})))
 
+(defn- clean?
+  "Whether the fast validator a subschema carries answers this instance by
+   itself. An applicator asks BEFORE it descends, so a member nothing is wrong
+   with never pays for the locations a walk would have to name. A run that
+   collects annotations still descends: the fast answer carries none."
+  [ctx sub instance]
+  (and (not (:annotate? ctx))
+       (map? sub)
+       (when-some [^Predicate p (::fast (.meta ^clojure.lang.IObj sub))] (.test p instance))))
 (defn- quiet
   "Keep a subschema's annotations, drop its errors - for a branch whose failure
    is not the schema's failure (`anyOf`, `if`)."
@@ -503,6 +512,30 @@
               tokens)
       (.toString sb))))
 
+(defn- descend
+  "The same context at a new location. A record `assoc` copies every field once
+   PER KEY, and a descent moves three or four of them, so the copy is made once
+   here instead."
+  [ctx kw-path res-path inst-path keyword]
+  (->Ctx (:index ctx)
+         (:dynamic ctx)
+         (:ref-cache ctx)
+         (:base ctx)
+         (:dyn-scope ctx)
+         (:validation? ctx)
+         (:format-assertion? ctx)
+         (:format? ctx)
+         (:annotate? ctx)
+         (:quiet? ctx)
+         (:id-resolved ctx)
+         inst-path
+         kw-path
+         (:res-prefix ctx)
+         res-path
+         (:depth ctx)
+         (:dialect ctx)
+         keyword))
+
 (defn- at-keyword
   "Descend into a keyword of the CURRENT schema: both the keyword location from
    the root and the pointer inside the current resource move. The current keyword
@@ -510,22 +543,23 @@
   ([ctx a]
    (if (:quiet? ctx)
      ctx
-     (assoc ctx
-            :keyword a
-            :kw-path (conj (:kw-path ctx) a)
-            :res-path (conj (:res-path ctx) a))))
+     (descend ctx (conj (:kw-path ctx) a) (conj (:res-path ctx) a) (:inst-path ctx) a)))
   ([ctx a b]
    (if (:quiet? ctx)
      ctx
-     (assoc ctx
-            :keyword a
-            :kw-path (conj (:kw-path ctx) a b)
-            :res-path (conj (:res-path ctx) a b)))))
+     (descend ctx (conj (:kw-path ctx) a b) (conj (:res-path ctx) a b) (:inst-path ctx) a))))
 
-(defn- at-instance [ctx token]
-  (if (:quiet? ctx)
-    ctx
-    (update ctx :inst-path conj token)))
+(defn- at-member
+  "Descend into a keyword AND the member of the instance it applies to. An
+   applicator always moves both, and moving them apart builds the context twice."
+  ([ctx a token]
+   (if (:quiet? ctx)
+     ctx
+     (descend ctx (conj (:kw-path ctx) a) (conj (:res-path ctx) a) (conj (:inst-path ctx) token) a)))
+  ([ctx a b token]
+   (if (:quiet? ctx)
+     ctx
+     (descend ctx (conj (:kw-path ctx) a b) (conj (:res-path ctx) a b) (conj (:inst-path ctx) token) a))))
 
 (defn- err* [ctx params message]
   {:valid? false
@@ -736,19 +770,21 @@
       ok
       (let [annotate? (:annotate? ctx)
             quiet? (:quiet? ctx)]
-        (loop [ks (seq (keys instance))
+        (loop [es (seq instance)
                res ok
                covered (when annotate? (transient #{}))]
           (cond
             (and quiet? (not (:valid? res))) res
-            (nil? ks) (if annotate? (assoc res :props (persistent! covered)) res)
+            (nil? es) (if annotate? (assoc res :props (persistent! covered)) res)
             :else
-            (let [k (first ks)
-                  v (get instance k)
-                  named? (and props? (contains? props k))
-                  res (if named?
-                        (merge-res res (child-res (f (-> ctx (at-keyword "properties" k) (at-instance k))
-                                                     (get props k)
+            (let [e (first es)
+                  k (key e)
+                  v (val e)
+                  sub (if props? (get props k absent) absent)
+                  named? (not (identical? absent sub))
+                  res (if (and named? (not (clean? ctx sub v)))
+                        (merge-res res (child-res (f (at-member ctx "properties" k k)
+                                                     sub
                                                      v)))
                         res)
                   matched (when patterns?
@@ -758,24 +794,32 @@
                                            acc))
                                        []
                                        patterns))
-                  res (reduce (fn [res [p sub]]
-                                (merge-res res (child-res (f (-> ctx (at-keyword "patternProperties" p) (at-instance k))
-                                                             sub
-                                                             v))))
-                              res
-                              matched)
+                  res (if (seq matched)
+                        (reduce (fn [res [p sub]]
+                                  (if (clean? ctx sub v)
+                                    res
+                                    (merge-res res (child-res (f (at-member ctx "patternProperties" p k)
+                                                                 sub
+                                                                 v)))))
+                                res
+                                matched)
+                        res)
                   covered? (or named? (seq matched))
-                  res (if (and additional? (not covered?))
-                        (merge-res res
-                                   (if (false? additional)
-                                     (err (at-keyword ctx "additionalProperties")
-                                          {:additionalProperty k}
-                                          (str "additional property " (pr-str k) " is not allowed"))
-                                     (child-res (f (-> ctx (at-keyword "additionalProperties") (at-instance k))
-                                                   additional
-                                                   v))))
-                        res)]
-              (recur (next ks)
+                  res (cond
+                        (or (not additional?) covered?) res
+
+                        (false? additional)
+                        (merge-res res (err (at-keyword ctx "additionalProperties")
+                                            {:additionalProperty k}
+                                            (str "additional property " (pr-str k) " is not allowed")))
+
+                        (clean? ctx additional v) res
+
+                        :else
+                        (merge-res res (child-res (f (at-member ctx "additionalProperties" k)
+                                                     additional
+                                                     v))))]
+              (recur (next es)
                      res
                      (if (and annotate? (or covered? additional?)) (conj! covered k) covered)))))))))
 
@@ -787,7 +831,7 @@
         (if (or (nil? ks) (and (:quiet? ctx) (not (:valid? res))))
           res
           (recur (next ks)
-                 (merge-res res (child-res (f (-> ctx (at-keyword "propertyNames") (at-instance (first ks)))
+                 (merge-res res (child-res (f (at-member ctx "propertyNames" (first ks))
                                               sub
                                               (first ks))))))))))
 
@@ -814,10 +858,15 @@
                          (assoc res :items (into #{} (range end)))
                          res)
             :else
-            (let [r (if (< i pre-n)
-                      (f (-> ctx (at-keyword "prefixItems" i) (at-instance i)) (nth prefix i) (nth instance i))
-                      (f (-> ctx (at-keyword "items") (at-instance i)) items (nth instance i)))]
-              (recur (inc i) (merge-res res (child-res r))))))))))
+            (let [prefixed? (< i pre-n)
+                  sub (if prefixed? (nth prefix i) items)
+                  v (nth instance i)]
+              (if (clean? ctx sub v)
+                (recur (inc i) res)
+                (let [r (if prefixed?
+                          (f (at-member ctx "prefixItems" i i) sub v)
+                          (f (at-member ctx "items" i) sub v))]
+                  (recur (inc i) (merge-res res (child-res r))))))))))))
 
 (defn- eval-contains
   "Evaluate contains and retain the matching indices for unevaluatedItems."
@@ -830,7 +879,7 @@
             matched (loop [i 0 acc (when annotate? (transient #{})) hits 0]
                       (if (>= i n)
                         [(when annotate? (persistent! acc)) hits]
-                        (if (:valid? (f (-> ctx (at-keyword "contains") (at-instance i)) sub (nth instance i)))
+                        (if (:valid? (f (at-member ctx "contains" i) sub (nth instance i)))
                           (recur (inc i) (if annotate? (conj! acc i) acc) (inc hits))
                           (recur (inc i) acc hits))))
             hits (long (second matched))
@@ -855,7 +904,7 @@
     ok
     (let [extra (remove evaluated (keys instance))
           rs (for [k extra]
-               (child-res (f (-> ctx (at-keyword "unevaluatedProperties") (at-instance k))
+               (child-res (f (at-member ctx "unevaluatedProperties" k)
                              (get schema "unevaluatedProperties")
                              (get instance k))))]
       (assoc (reduce merge-res ok rs) :props (set extra)))))
@@ -865,7 +914,7 @@
     ok
     (let [extra (remove evaluated (range (count instance)))
           rs (for [i extra]
-               (child-res (f (-> ctx (at-keyword "unevaluatedItems") (at-instance i))
+               (child-res (f (at-member ctx "unevaluatedItems" i)
                              (get schema "unevaluatedItems")
                              (nth instance i))))]
       (assoc (reduce merge-res ok rs) :items (set extra)))))
@@ -1131,11 +1180,8 @@
 
     ;; A node the fast compiler took answers a VALID instance by itself: nothing
     ;; under it can be wrong, so the walk that exists to say what IS wrong never
-    ;; runs. A document that asks what was EVALUATED still walks, because the
-    ;; fast answer carries no annotations.
-    (and (not (:annotate? ctx))
-         (map? schema)
-         (when-some [^Predicate p (::fast (meta schema))] (.test p instance)))
+    ;; runs.
+    (clean? ctx schema instance)
     ok
     (map? schema)
     (let [km (mask schema)
