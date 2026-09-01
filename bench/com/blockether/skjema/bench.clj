@@ -97,6 +97,11 @@
     :skjema (let [e (skjema/explainer user-json-schema)] #(e bad-user))
     :malli (let [e (m/explainer user-malli-schema)] #(e bad-user))
     :expect nil}
+   {:id "explain-valid"
+    :what "the same object VALID, errors asked for anyway - the common case"
+    :skjema (let [e (skjema/explainer user-json-schema)] #(e user))
+    :malli (let [e (m/explainer user-malli-schema)] #(e user))
+    :expect nil}
    {:id "scalar"
     :what "one string, minLength/maxLength - per-call overhead"
     :skjema (let [v (skjema/validator scalar-json-schema)] #(v "hello"))

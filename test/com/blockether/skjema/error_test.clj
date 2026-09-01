@@ -4,7 +4,8 @@
    Skjema keeps JSON Schema's standard BASIC-output locations and adds the two
    machine-readable fields callers otherwise have to scrape out of prose:
    `keyword` and keyword-specific `params`."
-  (:require [com.blockether.skjema.core :as skjema]
+  (:require [charred.api :as charred]
+            [com.blockether.skjema.core :as skjema]
             [lazytest.experimental.interfaces.clojure-test :refer [deftest is testing]]))
 
 (deftest a-nested-error-is-both-standard-and-machine-readable
@@ -91,7 +92,7 @@
 
 (deftest structured-errors-remain-json-values
   (let [answer (-> (skjema/explain {"required" ["name"]} {})
-                   skjema/write-schema
+                   charred/write-json-str
                    skjema/read-schema)]
     (is (= {"valid" false
             "errors" [{"instanceLocation" ""

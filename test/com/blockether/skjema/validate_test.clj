@@ -2,8 +2,9 @@
   "What a caller reads back: the specification's BASIC output, the options
    that change what asserts, and the keywords a schema older than 2020-12
    still means."
-  (:require [lazytest.experimental.interfaces.clojure-test :refer [deftest is testing]]
-            [com.blockether.skjema.core :as skjema]))
+  (:require [charred.api :as charred]
+            [com.blockether.skjema.core :as skjema]
+            [lazytest.experimental.interfaces.clojure-test :refer [deftest is testing]]))
 
 (def ^:private user-schema
   {"$id" "https://example.com/user.json"
@@ -56,7 +57,7 @@
                      "params" {"missingProperty" "name"}
                      "absoluteKeywordLocation" "https://example.com/user.json#/required"
                      "error" "missing required property \"name\""}]}
-         (skjema/read-schema (skjema/write-schema (skjema/explain user-schema {}))))))
+         (skjema/read-schema (charred/write-json-str (skjema/explain user-schema {}))))))
 
 (deftest a-schema-without-an-identifier-has-no-absolute-location
   (let [[error] (:errors (skjema/explain {"type" "integer"} "no"))]

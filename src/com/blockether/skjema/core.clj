@@ -57,15 +57,10 @@
                         {:skjema/error :schema/read :source label}
                         t))))))
 
-(defn write-schema
-  "Render a schema or validation result as compact JSON."
+(defn- json-str
+  "Compact JSON text for a value lifted out of a schema into an error message."
   ^String [value]
-  (try
-    (charred/write-json-str value :escape-unicode false :escape-slash false)
-    (catch Throwable t
-      (throw (ex-info (str "could not write schema: " (ex-message t))
-                      {:skjema/error :schema/write}
-                      t)))))
+  (charred/write-json-str value :escape-unicode false :escape-slash false))
 
 (def ^:private ^:const max-eval-depth
   "A cyclic self-reference can recurse without the instance ever shrinking.
@@ -1000,7 +995,7 @@
                   (merge-res res (err (at-keyword ctx "const")
                                       {:allowedValue const}
                                       (str "the instance is not the constant "
-                                           (write-schema const))))))
+                                           (json-str const))))))
               res)]
     (cond
       (json-number? instance) (if (has? km m-numbers) (assert-numbers km ctx schema instance res) res)
@@ -1293,10 +1288,19 @@
    (let [c (compiled schema opts)
          ctx (:ctx c)
          schema (:schema c)]
-     (fn [instance]
-       (let [r (eval-schema ctx schema instance)]
-         (when-not (:valid? r)
-           {:valid false :errors (vec (:errors r))}))))))
+     (if-let [^Predicate fast (:fast-validator c)]
+        ;; A passing instance is the common case and costs no error machinery:
+        ;; the compiled predicate answers it, and the evaluator runs only for
+        ;; the instances that have something to explain.
+       (fn [instance]
+         (when-not (.test fast instance)
+           (let [r (eval-schema ctx schema instance)]
+             (when-not (:valid? r)
+               {:valid false :errors (vec (:errors r))}))))
+       (fn [instance]
+         (let [r (eval-schema ctx schema instance)]
+           (when-not (:valid? r)
+             {:valid false :errors (vec (:errors r))})))))))
 
 (defn validate
   "True when `instance` satisfies the schema. `validator` is the same answer

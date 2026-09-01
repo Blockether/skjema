@@ -1,7 +1,7 @@
 (ns com.blockether.skjema.io-test
   (:require [clojure.java.io :as io]
             [com.blockether.skjema.core :as skjema]
-            [lazytest.experimental.interfaces.clojure-test :refer [deftest is testing thrown?]])
+            [lazytest.experimental.interfaces.clojure-test :refer [deftest is testing]])
   (:import (java.nio.file Files Path)
            (java.nio.file.attribute FileAttribute)))
 
@@ -30,16 +30,4 @@
       (is (re-find #"could not read schema from JSON string" (ex-message error)))))
   (is (= :schema/read
          (try (skjema/read-schema nil) nil
-              (catch clojure.lang.ExceptionInfo e (:skjema/error (ex-data e))))))
-  (is (= :schema/write
-         (try (skjema/write-schema ##NaN) nil
               (catch clojure.lang.ExceptionInfo e (:skjema/error (ex-data e)))))))
-
-(deftest writing-round-trips-json-values
-  (let [value {:valid false :errors [{:keyword "type" :params {:type "string"}}]}
-        text (skjema/write-schema value)]
-    (is (= {"valid" false
-            "errors" [{"keyword" "type" "params" {"type" "string"}}]}
-           (skjema/read-schema text)))
-    (is (not (re-find #"\\/" (skjema/write-schema {"$id" "https://example.com/schema"}))))
-    (is (thrown? clojure.lang.ExceptionInfo (skjema/write-schema {1 2})))))
