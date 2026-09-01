@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
+import clojure.lang.PersistentVector;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -199,16 +200,65 @@ public final class Fast {
     }
 
     /**
-     * Compile the common assertion/applicator subset into a Java predicate.
+     * Compile the common assertion/applicator subset into a compiled schema.
      * Null means that an advanced keyword needs the complete Clojure evaluator.
      */
-    public static Predicate<Object> compileValidator(Object schema, IFn patternCompiler) {
+    public static Compiled compileValidator(Object schema, IFn patternCompiler) {
         try {
-            Node node = compileNode(schema, patternCompiler);
-            return node::valid;
+            Level level = new Level();
+            Node node = compileNode(schema, patternCompiler, level);
+            return new Compiled(node, level.objects, level.arrays);
         } catch (UnsupportedSchema ignored) {
             return null;
         }
+    }
+
+    /**
+     * A compiled schema: the verdict it answers, and - when it declares members -
+     * WHICH of them a refusal belongs to. A report that is told that walks into the
+     * two members that are wrong instead of asking all nine.
+     */
+    public static final class Compiled implements Predicate<Object> {
+        private final Node node;
+        private final ObjectNode objects;
+        private final ArrayNode arrays;
+
+        Compiled(Node node, ObjectNode objects, ArrayNode arrays) {
+            this.node = node;
+            this.objects = objects;
+            this.arrays = arrays;
+        }
+
+        @Override
+        public boolean test(Object instance) {
+            return node.valid(instance);
+        }
+
+        /**
+         * Every member of `instance` this schema's own member checks refuse, in the
+         * order they were compiled, or null when the schema declares no member of
+         * the instance's kind and the caller has to look for itself. A member the
+         * instance does not carry is missing, not wrong: `required` answers for it.
+         */
+        public Object dirty(Object instance) {
+            ArrayList<Object> members = new ArrayList<>(4);
+            if (objects != null && instance instanceof Map<?, ?> object) {
+                objects.dirty(object, members);
+            } else if (arrays != null) {
+                List<?> array = list(instance);
+                if (array == null) return null;
+                arrays.dirty(array, members);
+            } else {
+                return null;
+            }
+            return PersistentVector.create(members);
+        }
+    }
+
+    /** Where the object and array nodes of ONE schema land while it compiles. */
+    private static final class Level {
+        private ObjectNode objects;
+        private ArrayNode arrays;
     }
 
     private interface Node {
@@ -240,6 +290,10 @@ public final class Fast {
      * to the complete evaluator.
      */
     private static Node compileNode(Object raw, IFn patternCompiler) {
+        return compileNode(raw, patternCompiler, null);
+    }
+
+    private static Node compileNode(Object raw, IFn patternCompiler, Level level) {
         if (Boolean.TRUE.equals(raw)) return ANY;
         if (Boolean.FALSE.equals(raw)) return NONE;
         if (!(raw instanceof Map<?, ?> source)) throw new UnsupportedSchema();
@@ -252,8 +306,8 @@ public final class Fast {
         addValues(checks, source);
         addNumbers(checks, source);
         addStrings(checks, source, patternCompiler);
-        addArrays(checks, source, patternCompiler);
-        addObjects(checks, source, patternCompiler);
+        addArrays(checks, source, patternCompiler, level);
+        addObjects(checks, source, patternCompiler, level);
         return all(checks);
     }
 
@@ -383,22 +437,24 @@ public final class Fast {
         }
     }
 
-    private static void addArrays(List<Node> checks, Map<?, ?> source, IFn patternCompiler) {
+    private static void addArrays(List<Node> checks, Map<?, ?> source, IFn patternCompiler, Level level) {
         Long maxItems = nonnegativeLong(source.get("maxItems"));
         Long minItems = nonnegativeLong(source.get("minItems"));
         boolean unique = Boolean.TRUE.equals(source.get("uniqueItems"));
         List<Node> prefixItems = compileNodes(source.get("prefixItems"), patternCompiler);
         Node items = schemaNode(source.get("items"), patternCompiler);
         if (maxItems == null && minItems == null && !unique && prefixItems == null && items == null) return;
-        checks.add(new ArrayNode(
+        ArrayNode node = new ArrayNode(
                 minItems == null ? -1L : minItems,
                 maxItems == null ? -1L : maxItems,
                 unique,
                 prefixItems == null ? null : prefixItems.toArray(new Node[0]),
-                items));
+                items);
+        if (level != null) level.arrays = node;
+        checks.add(node);
     }
 
-    private static void addObjects(List<Node> checks, Map<?, ?> source, IFn patternCompiler) {
+    private static void addObjects(List<Node> checks, Map<?, ?> source, IFn patternCompiler, Level level) {
         Long maxProperties = nonnegativeLong(source.get("maxProperties"));
         Long minProperties = nonnegativeLong(source.get("minProperties"));
         String[] required = strings(source.get("required"));
@@ -409,14 +465,16 @@ public final class Fast {
                 && properties == null && dependentRequired == null && !hasAdditional) {
             return;
         }
-        checks.add(new ObjectNode(
+        ObjectNode node = new ObjectNode(
                 minProperties == null ? -1L : minProperties,
                 maxProperties == null ? -1L : maxProperties,
                 required,
                 properties,
                 dependentRequired,
                 hasAdditional,
-                schemaNode(source.get("additionalProperties"), patternCompiler)));
+                schemaNode(source.get("additionalProperties"), patternCompiler));
+        if (level != null) level.objects = node;
+        checks.add(node);
     }
 
     /** One numeric bound. An integral bound answers integral instances in primitives. */
@@ -501,6 +559,19 @@ public final class Fast {
             for (int i = 0; i < prefixed; i++) if (!prefixItems[i].valid(array.get(i))) return false;
             if (items != null) for (int i = prefixed; i < size; i++) if (!items.valid(array.get(i))) return false;
             return true;
+        }
+
+        /** Every index whose item this node refuses: where a report has to look. */
+        void dirty(List<?> array, List<Object> members) {
+            int size = array.size();
+            int prefixed = prefixItems == null ? 0 : Math.min(prefixItems.length, size);
+            for (int i = 0; i < prefixed; i++) {
+                if (!prefixItems[i].valid(array.get(i))) members.add((long) i);
+            }
+            if (items == null) return;
+            for (int i = prefixed; i < size; i++) {
+                if (!items.valid(array.get(i))) members.add((long) i);
+            }
         }
     }
 
@@ -601,6 +672,22 @@ public final class Fast {
                 }
             }
             return true;
+        }
+
+        /** Every member this node refuses: where a report has to look. */
+        void dirty(Map<?, ?> object, List<Object> members) {
+            if (names != null) {
+                for (int i = 0; i < names.length; i++) {
+                    Object member = lookup(object, names[i]);
+                    if (member != MISSING && !nodes[i].valid(member)) members.add(names[i]);
+                }
+            }
+            if (!hasAdditional) return;
+            for (Map.Entry<?, ?> entry : object.entrySet()) {
+                if (declared == null || !declared.contains(entry.getKey())) {
+                    if (additional == null || !additional.valid(entry.getValue())) members.add(entry.getKey());
+                }
+            }
         }
     }
 

@@ -30,7 +30,7 @@
             [com.blockether.skjema.format :as fmt]
             [com.blockether.skjema.regex :as regex]
             [com.blockether.skjema.uri :as uri])
-  (:import (com.blockether.skjema Fast)
+  (:import (com.blockether.skjema Fast Fast$Compiled)
            (java.math BigDecimal)
            (java.nio.file Path)
            (java.util.function Predicate)))
@@ -489,6 +489,16 @@
   (and (not (:annotate? ctx))
        (map? sub)
        (when-some [^Predicate p (::fast (.meta ^clojure.lang.IObj sub))] (.test p instance))))
+(defn- dirty-members
+  "The members of `instance` the schema's own compiled checks refuse, or nil when
+   it has no compiled answer about them. A report told which two of nine members
+   are wrong walks into those and never names the rest; a run that collects
+   annotations has to visit every member anyway."
+  [ctx schema instance]
+  (when-not (:annotate? ctx)
+    (when-some [^Fast$Compiled c (::fast (.meta ^clojure.lang.IObj schema))]
+      (.dirty c instance))))
+
 (defn- quiet
   "Keep a subschema's annotations, drop its errors - for a branch whose failure
    is not the schema's failure (`anyOf`, `if`)."
@@ -757,6 +767,21 @@
    one lookup instead of a `contains?` beside it."
   (Object.))
 
+(defn- member-property
+  "One declared `properties` member, without the annotations it made inside."
+  [f ctx sub k v]
+  (child-res (f (at-member ctx "properties" k k) sub v)))
+
+(defn- member-additional
+  "One member no property or pattern named: a refusal when the schema forbids
+   extras, the subschema it hands them to otherwise."
+  [f ctx additional k v]
+  (if (false? additional)
+    (err (at-keyword ctx "additionalProperties")
+         {:additionalProperty k}
+         (str "additional property " (pr-str k) " is not allowed"))
+    (child-res (f (at-member ctx "additionalProperties" k) additional v))))
+
 (defn- eval-object-applicators
   "Evaluate properties, patternProperties and additionalProperties in one pass."
   [f ctx schema instance]
@@ -770,58 +795,57 @@
       ok
       (let [annotate? (:annotate? ctx)
             quiet? (:quiet? ctx)]
-        (loop [es (seq instance)
-               res ok
-               covered (when annotate? (transient #{}))]
-          (cond
-            (and quiet? (not (:valid? res))) res
-            (nil? es) (if annotate? (assoc res :props (persistent! covered)) res)
-            :else
-            (let [e (first es)
-                  k (key e)
-                  v (val e)
-                  sub (if props? (get props k absent) absent)
-                  named? (not (identical? absent sub))
-                  res (if (and named? (not (clean? ctx sub v)))
-                        (merge-res res (child-res (f (at-member ctx "properties" k k)
-                                                     sub
-                                                     v)))
-                        res)
-                  matched (when patterns?
-                            (reduce-kv (fn [acc p sub]
-                                         (if (re-find (regex/pattern-of p) k)
-                                           (conj acc [p sub])
-                                           acc))
-                                       []
-                                       patterns))
-                  res (if (seq matched)
-                        (reduce (fn [res [p sub]]
-                                  (if (clean? ctx sub v)
-                                    res
-                                    (merge-res res (child-res (f (at-member ctx "patternProperties" p k)
-                                                                 sub
-                                                                 v)))))
-                                res
-                                matched)
-                        res)
-                  covered? (or named? (seq matched))
-                  res (cond
-                        (or (not additional?) covered?) res
-
-                        (false? additional)
-                        (merge-res res (err (at-keyword ctx "additionalProperties")
-                                            {:additionalProperty k}
-                                            (str "additional property " (pr-str k) " is not allowed")))
-
-                        (clean? ctx additional v) res
-
-                        :else
-                        (merge-res res (child-res (f (at-member ctx "additionalProperties" k)
-                                                     additional
-                                                     v))))]
-              (recur (next es)
-                     res
-                     (if (and annotate? (or covered? additional?)) (conj! covered k) covered)))))))))
+        (if-some [dirty (dirty-members ctx schema instance)]
+          (reduce (fn [res k]
+                    (if (and quiet? (not (:valid? res)))
+                      (reduced res)
+                      (let [v (get instance k)
+                            sub (if props? (get props k absent) absent)]
+                        (merge-res res (if (identical? absent sub)
+                                         (member-additional f ctx additional k v)
+                                         (member-property f ctx sub k v))))))
+                  ok
+                  dirty)
+          (loop [es (seq instance)
+                 res ok
+                 covered (when annotate? (transient #{}))]
+            (cond
+              (and quiet? (not (:valid? res))) res
+              (nil? es) (if annotate? (assoc res :props (persistent! covered)) res)
+              :else
+              (let [e (first es)
+                    k (key e)
+                    v (val e)
+                    sub (if props? (get props k absent) absent)
+                    named? (not (identical? absent sub))
+                    res (if (and named? (not (clean? ctx sub v)))
+                          (merge-res res (member-property f ctx sub k v))
+                          res)
+                    matched (when patterns?
+                              (reduce-kv (fn [acc p sub]
+                                           (if (re-find (regex/pattern-of p) k)
+                                             (conj acc [p sub])
+                                             acc))
+                                         []
+                                         patterns))
+                    res (if (seq matched)
+                          (reduce (fn [res [p sub]]
+                                    (if (clean? ctx sub v)
+                                      res
+                                      (merge-res res (child-res (f (at-member ctx "patternProperties" p k)
+                                                                   sub
+                                                                   v)))))
+                                  res
+                                  matched)
+                          res)
+                    covered? (or named? (seq matched))
+                    res (cond
+                          (or (not additional?) covered?) res
+                          (clean? ctx additional v) res
+                          :else (merge-res res (member-additional f ctx additional k v)))]
+                (recur (next es)
+                       res
+                       (if (and annotate? (or covered? additional?)) (conj! covered k) covered))))))))))
 
 (defn- eval-property-names [f ctx schema instance]
   (let [sub (get schema "propertyNames" absent)]
@@ -848,25 +872,36 @@
     (if-not (and (sequential? instance) (or prefix? items?))
       ok
       (let [n (count instance)
-            pre-n (if prefix? (min (count prefix) n) 0)
+            pre-n (long (if prefix? (min (count prefix) n) 0))
             end (long (if items? n pre-n))
-            quiet? (:quiet? ctx)]
-        (loop [i 0 res ok]
-          (cond
-            (and quiet? (not (:valid? res))) res
-            (>= i end) (if (:annotate? ctx)
-                         (assoc res :items (into #{} (range end)))
-                         res)
-            :else
-            (let [prefixed? (< i pre-n)
-                  sub (if prefixed? (nth prefix i) items)
-                  v (nth instance i)]
-              (if (clean? ctx sub v)
-                (recur (inc i) res)
-                (let [r (if prefixed?
-                          (f (at-member ctx "prefixItems" i i) sub v)
-                          (f (at-member ctx "items" i) sub v))]
-                  (recur (inc i) (merge-res res (child-res r))))))))))))
+            quiet? (:quiet? ctx)
+            item (fn [res ^long i]
+                   (let [prefixed? (< i pre-n)
+                         sub (if prefixed? (nth prefix i) items)
+                         v (nth instance i)
+                         r (if prefixed?
+                             (f (at-member ctx "prefixItems" i i) sub v)
+                             (f (at-member ctx "items" i) sub v))]
+                     (merge-res res (child-res r))))]
+        (if-some [dirty (dirty-members ctx schema instance)]
+          (reduce (fn [res idx]
+                    (if (and quiet? (not (:valid? res)))
+                      (reduced res)
+                      (item res (long idx))))
+                  ok
+                  dirty)
+          (loop [i 0 res ok]
+            (cond
+              (and quiet? (not (:valid? res))) res
+              (>= i end) (if (:annotate? ctx)
+                           (assoc res :items (into #{} (range end)))
+                           res)
+              :else
+              (let [sub (if (< i pre-n) (nth prefix i) items)
+                    v (nth instance i)]
+                (if (clean? ctx sub v)
+                  (recur (inc i) res)
+                  (recur (inc i) (item res i)))))))))))
 
 (defn- eval-contains
   "Evaluate contains and retain the matching indices for unevaluatedItems."
