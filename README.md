@@ -20,10 +20,10 @@ consumer did not choose. `skjema` binds nothing:
 - **Validation works on parsed data.** `compile` indexes a schema once;
   `validate` walks the instance, not the schema map. The instance may come
   from `skjema.json`, from charred, from anywhere — it is plain Clojure data.
-- **Errors are the specification's own output format** — `valid`,
-  `instanceLocation`, `keywordLocation`, `absoluteKeywordLocation`, `error` —
-  as a Clojure map, so writing it back out is one call and no second
-  vocabulary exists.
+- **Errors preserve BASIC output and add actionability.** Every error carries the
+  standard `instanceLocation`, `keywordLocation`, optional
+  `absoluteKeywordLocation`, and `error`; `keyword` plus keyword-specific
+  `params` let a UI act without parsing English. The whole answer remains JSON.
 
 ## Use
 
@@ -41,10 +41,12 @@ consumer did not choose. `skjema` binds nothing:
 ;;     :errors [{:instanceLocation "/name"
 ;;               :keywordLocation "/properties/name/type"
 ;;               :absoluteKeywordLocation "https://example.com/user.json#/properties/name/type"
+;;               :keyword "type"
+;;               :params {:type "string"}
 ;;               :error "expected string, got integer"}]}
 
 (json/write-str (skjema/validate schema {"name" 42}))
-;; => the same answer as the specification's BASIC output, key for key
+;; => BASIC output locations plus machine-readable keyword and params
 ```
 
 `compile` once when the schema is reused, and hand it whatever it references —

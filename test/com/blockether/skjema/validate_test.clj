@@ -40,6 +40,8 @@
   (is (= {"valid" false
           "errors" [{"instanceLocation" ""
                      "keywordLocation" "/required"
+                     "keyword" "required"
+                     "params" {"missingProperty" "name"}
                      "absoluteKeywordLocation" "https://example.com/user.json#/required"
                      "error" "missing required property \"name\""}]}
          (json/read-str (json/write-str (skjema/validate user-schema {}))))))
@@ -59,6 +61,7 @@
       (is (true? (skjema/valid? {"format" "sort-code"} "anything" {:format-assertion true}))))
     (testing "and the failure reads like every other error"
       (is (= [{:instanceLocation "" :keywordLocation "/format"
+               :keyword "format" :params {:format "ipv4"}
                :error "the string is not a valid ipv4"}]
              (:errors (skjema/validate schema "not-an-address" {:format-assertion true})))))))
 
