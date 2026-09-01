@@ -30,7 +30,7 @@
             [com.blockether.skjema.format :as fmt]
             [com.blockether.skjema.regex :as regex]
             [com.blockether.skjema.uri :as uri])
-  (:import (com.blockether.skjema Fast Fast$Compiled)
+  (:import (com.blockether.skjema Fast Fast$Compiled Fast$Refusal)
            (java.math BigDecimal)
            (java.nio.file Path)
            (java.util.function Predicate)))
@@ -74,7 +74,7 @@
            ;; allocation on the hot path and a slower read when an error names it.
            [index dynamic ref-cache base dyn-scope validation? format-assertion? format?
             annotate? quiet? id-resolved inst-path kw-path res-prefix res-path depth dialect
-            keyword])
+            keyword dialect-uri])
 
 (def ^:private validation-vocabulary
   "https://json-schema.org/draft/2020-12/vocab/validation")
@@ -617,7 +617,8 @@
          res-path
          (:depth ctx)
          (:dialect ctx)
-         keyword))
+         keyword
+         (:dialect-uri ctx)))
 
 (defn- at-keyword
   "Descend into a keyword of the CURRENT schema: both the keyword location from
@@ -833,6 +834,56 @@
       (err (at-keyword ctx "format") {:format f}
            (str "the string is not a valid " f)))))
 
+(defn- phrase
+  "The words of one error, appended in place. `clojure.core/str` walks a sequence
+   from its third argument onwards, and an explained instance pays for that on
+   every error it answers, so the prose of a refusal is built here instead."
+  (^String [a b c]
+   (.toString (doto (StringBuilder. 48)
+                (.append ^String (str a))
+                (.append ^String (str b))
+                (.append ^String (str c)))))
+  (^String [a b c d]
+   (.toString (doto (StringBuilder. 64)
+                (.append ^String (str a))
+                (.append ^String (str b))
+                (.append ^String (str c))
+                (.append ^String (str d)))))
+  (^String [a b c d e]
+   (.toString (doto (StringBuilder. 64)
+                (.append ^String (str a))
+                (.append ^String (str b))
+                (.append ^String (str c))
+                (.append ^String (str d))
+                (.append ^String (str e))))))
+
+(defn- wording
+  "The prose one refused keyword answers: `a` is what the schema said, `b` is what
+   the instance is. The walking evaluator and the compiled explainer both word a
+   refusal here, so neither can drift away from the other."
+  [^String kw a b]
+  (case kw
+    "type" (phrase "expected " (str/join " or " a) ", got " (json-type b))
+    "enum" "the instance is not one of the enumerated values"
+    "const" (str "the instance is not the constant " (json-str a))
+    "multipleOf" (phrase b " is not a multiple of " a)
+    "maximum" (phrase b " is greater than the maximum " a)
+    "exclusiveMaximum" (phrase b " is not below the exclusive maximum " a)
+    "minimum" (phrase b " is less than the minimum " a)
+    "exclusiveMinimum" (phrase b " is not above the exclusive minimum " a)
+    "maxLength" (phrase "the string is " b " characters long, the maximum is " a)
+    "minLength" (phrase "the string is " b " characters long, the minimum is " a)
+    "pattern" (str "the string does not match the pattern " (pr-str a))
+    "maxItems" (phrase "the array has " b " items, the maximum is " a)
+    "minItems" (phrase "the array has " b " items, the minimum is " a)
+    "uniqueItems" (phrase "items " a " and " b " are duplicates")
+    "maxProperties" (phrase "the object has " b " properties, the maximum is " a)
+    "minProperties" (phrase "the object has " b " properties, the minimum is " a)
+    "required" (str "missing required property " (pr-str a))
+    "dependentRequired" (phrase "property " (pr-str a) " requires " (pr-str b))
+    "additionalProperties" (phrase "additional property " (pr-str a) " is not allowed")
+    "falseSchema" "the false schema rejects every instance"))
+
 ;; Child applicators
 
 (def ^:private absent
@@ -843,7 +894,7 @@
 (defn- member-property
   "One declared `properties` member, without the annotations it made inside."
   [f ctx sub k v]
-  (child-res (f (at-member ctx "properties" k k) sub v)))
+  (child-res (f (at-member ctx "properties" k k) sub v true)))
 
 (defn- member-additional
   "One member no property or pattern named: a refusal when the schema forbids
@@ -852,12 +903,12 @@
   (if (false? additional)
     (err (at-keyword ctx "additionalProperties")
          {:additionalProperty k}
-         (str "additional property " (pr-str k) " is not allowed"))
-    (child-res (f (at-member ctx "additionalProperties" k) additional v))))
+         (wording "additionalProperties" k nil))
+    (child-res (f (at-member ctx "additionalProperties" k) additional v true))))
 
 (defn- eval-object-applicators
   "Evaluate properties, patternProperties and additionalProperties in one pass."
-  [f km ^objects sl ctx schema instance]
+  [f km ^objects sl ctx schema instance refused]
   (let [props (aget sl s-properties)
         patterns (aget sl s-pattern-properties)
         additional (aget sl s-additional-properties)
@@ -868,7 +919,7 @@
       ok
       (let [annotate? (:annotate? ctx)
             quiet? (:quiet? ctx)]
-        (if-some [dirty (dirty-members ctx schema instance)]
+        (if-some [dirty (if (vector? refused) refused (dirty-members ctx schema instance))]
           (reduce (fn [res k]
                     (if (and quiet? (not (:valid? res)))
                       (reduced res)
@@ -907,7 +958,8 @@
                                       res
                                       (merge-res res (child-res (f (at-member ctx "patternProperties" p k)
                                                                    sub
-                                                                   v)))))
+                                                                   v
+                                                                   true)))))
                                   res
                                   matched)
                           res)
@@ -937,7 +989,7 @@
    them. The indices they touched are what `unevaluatedItems` later subtracts -
    and that set is only built when the document has an `unevaluated*` to spend
    it on."
-  [f km ^objects sl ctx schema instance]
+  [f km ^objects sl ctx schema instance refused]
   (let [prefix (aget sl s-prefix-items)
         items (aget sl s-items)
         items? (has? km m-items)
@@ -953,10 +1005,10 @@
                          sub (if prefixed? (nth prefix i) items)
                          v (nth instance i)
                          r (if prefixed?
-                             (f (at-member ctx "prefixItems" i i) sub v)
-                             (f (at-member ctx "items" i) sub v))]
+                             (f (at-member ctx "prefixItems" i i) sub v true)
+                             (f (at-member ctx "items" i) sub v true))]
                      (merge-res res (child-res r))))]
-        (if-some [dirty (dirty-members ctx schema instance)]
+        (if-some [dirty (if (vector? refused) refused (dirty-members ctx schema instance))]
           (reduce (fn [res idx]
                     (if (and quiet? (not (:valid? res)))
                       (reduced res)
@@ -1038,27 +1090,27 @@
         res (if (and (number? divisor) (not (multiple-of? instance divisor)))
               (merge-res res (err (at-keyword ctx "multipleOf")
                                   {:multipleOf divisor}
-                                  (str instance " is not a multiple of " divisor)))
+                                  (wording "multipleOf" divisor instance)))
               res)
         res (if (and (number? maximum) (pos? (num-compare instance maximum)))
               (merge-res res (err (at-keyword ctx "maximum")
                                   {:comparison "<=" :limit maximum}
-                                  (str instance " is greater than the maximum " maximum)))
+                                  (wording "maximum" maximum instance)))
               res)
         res (if (and (number? exclusive-max) (not (neg? (num-compare instance exclusive-max))))
               (merge-res res (err (at-keyword ctx "exclusiveMaximum")
                                   {:comparison "<" :limit exclusive-max}
-                                  (str instance " is not below the exclusive maximum " exclusive-max)))
+                                  (wording "exclusiveMaximum" exclusive-max instance)))
               res)
         res (if (and (number? minimum) (neg? (num-compare instance minimum)))
               (merge-res res (err (at-keyword ctx "minimum")
                                   {:comparison ">=" :limit minimum}
-                                  (str instance " is less than the minimum " minimum)))
+                                  (wording "minimum" minimum instance)))
               res)]
     (if (and (number? exclusive-min) (not (pos? (num-compare instance exclusive-min))))
       (merge-res res (err (at-keyword ctx "exclusiveMinimum")
                           {:comparison ">" :limit exclusive-min}
-                          (str instance " is not above the exclusive minimum " exclusive-min)))
+                          (wording "exclusiveMinimum" exclusive-min instance)))
       res)))
 
 (defn- assert-strings [^objects sl ctx instance res]
@@ -1070,19 +1122,17 @@
         res (if (and (number? max-length) (> (long length) (long max-length)))
               (merge-res res (err (at-keyword ctx "maxLength")
                                   {:limit max-length :actual length}
-                                  (str "the string is " length
-                                       " characters long, the maximum is " max-length)))
+                                  (wording "maxLength" max-length length)))
               res)
         res (if (and (number? min-length) (< (long length) (long min-length)))
               (merge-res res (err (at-keyword ctx "minLength")
                                   {:limit min-length :actual length}
-                                  (str "the string is " length
-                                       " characters long, the minimum is " min-length)))
+                                  (wording "minLength" min-length length)))
               res)]
     (if (and (string? pattern) (not (re-find (regex/pattern-of pattern) instance)))
       (merge-res res (err (at-keyword ctx "pattern")
                           {:pattern pattern}
-                          (str "the string does not match the pattern " (pr-str pattern))))
+                          (wording "pattern" pattern nil)))
       res)))
 
 (defn- duplicate-indices [items]
@@ -1101,18 +1151,18 @@
         res (if (and (number? max-items) (> (long n) (long max-items)))
               (merge-res res (err (at-keyword ctx "maxItems")
                                   {:limit max-items :actual n}
-                                  (str "the array has " n " items, the maximum is " max-items)))
+                                  (wording "maxItems" max-items n)))
               res)
         res (if (and (number? min-items) (< (long n) (long min-items)))
               (merge-res res (err (at-keyword ctx "minItems")
                                   {:limit min-items :actual n}
-                                  (str "the array has " n " items, the minimum is " min-items)))
+                                  (wording "minItems" min-items n)))
               res)]
     (if unique?
       (if-let [[i j] (duplicate-indices (mapv canonical instance))]
         (merge-res res (err (at-keyword ctx "uniqueItems")
                             {:i i :j j}
-                            (str "items " i " and " j " are duplicates")))
+                            (wording "uniqueItems" i j)))
         res)
       res)))
 
@@ -1125,21 +1175,23 @@
         res (if (and (number? max-props) (> (long n) (long max-props)))
               (merge-res res (err (at-keyword ctx "maxProperties")
                                   {:limit max-props :actual n}
-                                  (str "the object has " n " properties, the maximum is " max-props)))
+                                  (wording "maxProperties" max-props n)))
               res)
         res (if (and (number? min-props) (< (long n) (long min-props)))
               (merge-res res (err (at-keyword ctx "minProperties")
                                   {:limit min-props :actual n}
-                                  (str "the object has " n " properties, the minimum is " min-props)))
+                                  (wording "minProperties" min-props n)))
               res)
         res (if (sequential? required)
               (reduce (fn [res missing]
-                        (merge-res res
-                                   (err (at-keyword ctx "required")
-                                        {:missingProperty missing}
-                                        (str "missing required property " (pr-str missing)))))
+                        (if (contains? instance missing)
+                          res
+                          (merge-res res
+                                     (err (at-keyword ctx "required")
+                                          {:missingProperty missing}
+                                          (wording "required" missing nil)))))
                       res
-                      (remove #(contains? instance %) required))
+                      required)
               res)]
     (if (map? dependent)
       (reduce (fn [res [property required]]
@@ -1152,8 +1204,7 @@
                                              :missingProperty missing
                                              :deps (str/join ", " required)
                                              :depsCount (count required)}
-                                            (str "property " (pr-str property)
-                                                 " requires " (pr-str missing))))))
+                                            (wording "dependentRequired" property missing)))))
                         res
                         required))
               res
@@ -1170,7 +1221,7 @@
                   ok
                   (err (at-keyword ctx "type")
                        {:type t}
-                       (str "expected " (str/join " or " types) ", got " (json-type instance)))))
+                       (wording "type" types instance))))
               ok)
         res (if (has? km m-enum)
               (let [values (aget sl s-enum)]
@@ -1178,7 +1229,7 @@
                   res
                   (merge-res res (err (at-keyword ctx "enum")
                                       {:allowedValues values}
-                                      "the instance is not one of the enumerated values"))))
+                                      (wording "enum" nil nil)))))
               res)
         res (if (has? km m-const)
               (let [const (aget sl s-const)]
@@ -1186,8 +1237,7 @@
                   res
                   (merge-res res (err (at-keyword ctx "const")
                                       {:allowedValue const}
-                                      (str "the instance is not the constant "
-                                           (json-str const))))))
+                                      (wording "const" const nil)))))
               res)]
     (cond
       (json-number? instance) (if (has? km m-numbers) (assert-numbers sl ctx instance res) res)
@@ -1195,6 +1245,396 @@
       (map? instance) (if (has? km m-objects) (assert-objects sl ctx instance res) res)
       (sequential? instance) (if (has? km m-arrays) (assert-arrays sl ctx instance res) res)
       :else res)))
+
+;; The compiled explainer
+;;
+;; A document the fast compiler took carries a closed set of keywords, and every
+;; location its errors name is known while it compiles. What the instance is left
+;; to pay for is the prose of the errors it actually has, so an invalid instance
+;; is explained by one walk that allocates those and nothing else.
+
+(def ^:private unexplainable
+  "What a node answers when it cannot be compiled into errors, so the document
+   keeps the walking evaluator instead."
+  (Object.))
+
+(defn- error-of
+  "One structured error, at locations the compiler already knows."
+  [^String inst-loc ^String kw-loc ^String kw params message]
+  {:instanceLocation inst-loc
+   :keywordLocation kw-loc
+   :keyword kw
+   :params params
+   :error message})
+
+(defn- member-location ^String [^String loc k]
+  (phrase loc "/" (uri/escape-token (if (string? k) k (str k)))))
+
+(defn- explain-chain
+  "The checks of one node as a single function, in the order the walking evaluator
+   runs them. Each answers the errors it was handed plus the ones it found."
+  [checks]
+  (let [checks (vec (remove nil? checks))]
+    (case (count checks)
+      0 nil
+      1 (nth checks 0)
+      2 (let [a (nth checks 0)
+              b (nth checks 1)]
+          (fn [v l out] (b v l (a v l out))))
+      (let [^objects fs (into-array clojure.lang.IFn checks)]
+        (fn [v l out]
+          (areduce fs i acc out (.invoke ^clojure.lang.IFn (aget fs i) v l acc)))))))
+
+(defn- explain-number-assertions [schema ^String kw-loc]
+  (let [divisor (get schema "multipleOf")
+        maximum (get schema "maximum")
+        exclusive-max (get schema "exclusiveMaximum")
+        minimum (get schema "minimum")
+        exclusive-min (get schema "exclusiveMinimum")
+        f (explain-chain
+           [(when (number? divisor)
+              (let [kl (str kw-loc "/multipleOf")
+                    params {:multipleOf divisor}]
+                (fn [v l out]
+                  (if (multiple-of? v divisor)
+                    out
+                    (conj! out (error-of l kl "multipleOf" params (wording "multipleOf" divisor v)))))))
+            (when (number? maximum)
+              (let [kl (str kw-loc "/maximum")
+                    params {:comparison "<=" :limit maximum}]
+                (fn [v l out]
+                  (if (pos? (num-compare v maximum))
+                    (conj! out (error-of l kl "maximum" params (wording "maximum" maximum v)))
+                    out))))
+            (when (number? exclusive-max)
+              (let [kl (str kw-loc "/exclusiveMaximum")
+                    params {:comparison "<" :limit exclusive-max}]
+                (fn [v l out]
+                  (if (neg? (num-compare v exclusive-max))
+                    out
+                    (conj! out (error-of l kl "exclusiveMaximum" params
+                                         (wording "exclusiveMaximum" exclusive-max v)))))))
+            (when (number? minimum)
+              (let [kl (str kw-loc "/minimum")
+                    params {:comparison ">=" :limit minimum}]
+                (fn [v l out]
+                  (if (neg? (num-compare v minimum))
+                    (conj! out (error-of l kl "minimum" params (wording "minimum" minimum v)))
+                    out))))
+            (when (number? exclusive-min)
+              (let [kl (str kw-loc "/exclusiveMinimum")
+                    params {:comparison ">" :limit exclusive-min}]
+                (fn [v l out]
+                  (if (pos? (num-compare v exclusive-min))
+                    out
+                    (conj! out (error-of l kl "exclusiveMinimum" params
+                                         (wording "exclusiveMinimum" exclusive-min v)))))))])]
+    (when f
+      (fn [v l out] (if (json-number? v) (f v l out) out)))))
+
+(defn- explain-string-assertions [schema ^String kw-loc]
+  (let [max-length (get schema "maxLength")
+        min-length (get schema "minLength")
+        pattern (get schema "pattern")
+        f (explain-chain
+           [(when (number? max-length)
+              (let [kl (str kw-loc "/maxLength")]
+                (fn [v l out]
+                  (let [n (code-point-count v)]
+                    (if (> n (long max-length))
+                      (conj! out (error-of l kl "maxLength" {:limit max-length :actual n}
+                                           (wording "maxLength" max-length n)))
+                      out)))))
+            (when (number? min-length)
+              (let [kl (str kw-loc "/minLength")]
+                (fn [v l out]
+                  (let [n (code-point-count v)]
+                    (if (< n (long min-length))
+                      (conj! out (error-of l kl "minLength" {:limit min-length :actual n}
+                                           (wording "minLength" min-length n)))
+                      out)))))
+            (when (string? pattern)
+              (let [kl (str kw-loc "/pattern")
+                    params {:pattern pattern}
+                    p (regex/pattern-of pattern)]
+                (fn [v l out]
+                  (if (re-find p v)
+                    out
+                    (conj! out (error-of l kl "pattern" params (wording "pattern" pattern nil)))))))])]
+    (when f
+      (fn [v l out] (if (string? v) (f v l out) out)))))
+
+(defn- explain-array-assertions [schema ^String kw-loc]
+  (let [max-items (get schema "maxItems")
+        min-items (get schema "minItems")
+        unique? (true? (get schema "uniqueItems"))
+        f (explain-chain
+           [(when (number? max-items)
+              (let [kl (str kw-loc "/maxItems")]
+                (fn [v l out]
+                  (let [n (count v)]
+                    (if (> (long n) (long max-items))
+                      (conj! out (error-of l kl "maxItems" {:limit max-items :actual n}
+                                           (wording "maxItems" max-items n)))
+                      out)))))
+            (when (number? min-items)
+              (let [kl (str kw-loc "/minItems")]
+                (fn [v l out]
+                  (let [n (count v)]
+                    (if (< (long n) (long min-items))
+                      (conj! out (error-of l kl "minItems" {:limit min-items :actual n}
+                                           (wording "minItems" min-items n)))
+                      out)))))
+            (when unique?
+              (let [kl (str kw-loc "/uniqueItems")]
+                (fn [v l out]
+                  (if-let [[i j] (duplicate-indices (mapv canonical v))]
+                    (conj! out (error-of l kl "uniqueItems" {:i i :j j} (wording "uniqueItems" i j)))
+                    out))))])]
+    (when f
+      (fn [v l out] (if (sequential? v) (f v l out) out)))))
+
+(defn- explain-object-assertions [schema ^String kw-loc]
+  (let [max-props (get schema "maxProperties")
+        min-props (get schema "minProperties")
+        required (get schema "required")
+        dependent (get schema "dependentRequired")
+        f (explain-chain
+           [(when (number? max-props)
+              (let [kl (str kw-loc "/maxProperties")]
+                (fn [v l out]
+                  (let [n (count v)]
+                    (if (> (long n) (long max-props))
+                      (conj! out (error-of l kl "maxProperties" {:limit max-props :actual n}
+                                           (wording "maxProperties" max-props n)))
+                      out)))))
+            (when (number? min-props)
+              (let [kl (str kw-loc "/minProperties")]
+                (fn [v l out]
+                  (let [n (count v)]
+                    (if (< (long n) (long min-props))
+                      (conj! out (error-of l kl "minProperties" {:limit min-props :actual n}
+                                           (wording "minProperties" min-props n)))
+                      out)))))
+            (when (sequential? required)
+              (let [kl (str kw-loc "/required")
+                    ^objects names (into-array Object required)
+                    n (alength names)]
+                (fn [v l out]
+                  (loop [i 0 out out]
+                    (if (== i n)
+                      out
+                      (let [name (aget names i)]
+                        (recur (inc i)
+                               (if (contains? v name)
+                                 out
+                                 (conj! out (error-of l kl "required" {:missingProperty name}
+                                                      (wording "required" name nil)))))))))))
+            (when (map? dependent)
+              (let [kl (str kw-loc "/dependentRequired")
+                    groups (mapv (fn [[property names]]
+                                   [property
+                                    (mapv (fn [missing]
+                                            [missing
+                                             {:property property
+                                              :missingProperty missing
+                                              :deps (str/join ", " names)
+                                              :depsCount (count names)}
+                                             (wording "dependentRequired" property missing)])
+                                          names)])
+                                 dependent)]
+                (fn [v l out]
+                  (reduce (fn [out [property misses]]
+                            (if-not (contains? v property)
+                              out
+                              (reduce (fn [out [missing params message]]
+                                        (if (contains? v missing)
+                                          out
+                                          (conj! out (error-of l kl "dependentRequired" params message))))
+                                      out
+                                      misses)))
+                          out
+                          groups))))])]
+    (if (and (map? dependent) (not (every? sequential? (vals dependent))))
+      unexplainable
+      (when f
+        (fn [v l out] (if (map? v) (f v l out) out))))))
+
+(defn- explain-value-assertions [schema ^String kw-loc]
+  (let [t (get schema "type" absent)
+        values (get schema "enum" absent)
+        const (get schema "const" absent)]
+    [(when-not (identical? absent t)
+       (let [types (if (sequential? t) t [t])
+             kl (str kw-loc "/type")
+             params {:type t}
+             one (when (string? t) t)]
+         (fn [v l out]
+           (if (if one (type-match? one v) (some #(type-match? % v) types))
+             out
+             (conj! out (error-of l kl "type" params (wording "type" types v)))))))
+     (when-not (identical? absent values)
+       (let [kl (str kw-loc "/enum")
+             params {:allowedValues values}
+             message (wording "enum" nil nil)]
+         (fn [v l out]
+           (if (some #(json-equal? % v) values)
+             out
+             (conj! out (error-of l kl "enum" params message))))))
+     (when-not (identical? absent const)
+       (let [kl (str kw-loc "/const")
+             params {:allowedValue const}
+             message (wording "const" const nil)]
+         (fn [v l out]
+           (if (json-equal? const v)
+             out
+             (conj! out (error-of l kl "const" params message))))))]))
+
+(defn- explain-object-applicators
+  "The declared properties and the extras, over the members the compiled node
+   refused. A member nothing is wrong with is never visited: the compiled node
+   already answered for it."
+  [f schema ^String kw-loc]
+  (let [props (get schema "properties")
+        additional (get schema "additionalProperties" absent)
+        props? (map? props)
+        additional? (not (identical? absent additional))
+        by-key (when props?
+                 (reduce-kv (fn [acc k sub]
+                              (if (identical? unexplainable acc)
+                                acc
+                                (let [child (f sub (str kw-loc "/properties/" (uri/escape-token k)) "properties")]
+                                  (if (identical? unexplainable child)
+                                    unexplainable
+                                    (assoc acc k [(str "/" (uri/escape-token k)) child])))))
+                            {}
+                            props))
+        extra (when additional?
+                (if (false? additional)
+                  ::forbidden
+                  (f additional (str kw-loc "/additionalProperties") "additionalProperties")))]
+    (cond
+      (identical? unexplainable by-key) unexplainable
+      (identical? unexplainable extra) unexplainable
+      (and (empty? by-key) (nil? extra)) nil
+      :else
+      (let [by-key (or by-key {})
+            kl (str kw-loc "/additionalProperties")]
+        (fn [v ^String l out refused]
+          (if-not (map? v)
+            out
+            (let [^clojure.lang.PersistentVector refused refused
+                  n (.count refused)]
+              (loop [i 0 out out]
+                (if (< i n)
+                  (let [k (.nth refused i)
+                        member (.nth refused (inc i))]
+                    (recur (+ i 2)
+                           (if-some [entry (get by-key k)]
+                             (if-let [child (nth entry 1)]
+                               (child member (.concat l ^String (nth entry 0)) out)
+                               out)
+                             (cond
+                               (identical? ::forbidden extra)
+                               (conj! out (error-of l kl "additionalProperties"
+                                                    {:additionalProperty k}
+                                                    (wording "additionalProperties" k nil)))
+
+                               (some? extra)
+                               (extra member (member-location l k) out)
+
+                               :else out))))
+                  out)))))))))
+
+(defn- explain-array-applicators
+  "`prefixItems` covers the first N positions, `items` everything after them, over
+   the indices the compiled node refused."
+  [f schema ^String kw-loc]
+  (let [prefix (get schema "prefixItems")
+        items (get schema "items" absent)
+        prefix? (sequential? prefix)
+        compiled-prefix (when prefix?
+                          (mapv (fn [i sub] (f sub (str kw-loc "/prefixItems/" i) "prefixItems"))
+                                (range)
+                                prefix))
+        compiled-items (when-not (identical? absent items)
+                         (f items (str kw-loc "/items") "items"))]
+    (cond
+      (some #(identical? unexplainable %) compiled-prefix) unexplainable
+      (identical? unexplainable compiled-items) unexplainable
+      (and (nil? compiled-items) (every? nil? compiled-prefix)) nil
+      :else
+      (let [^objects pre (into-array Object (or compiled-prefix []))
+            pre-n (alength pre)]
+        (fn [v l out refused]
+          (if-not (sequential? v)
+            out
+            (let [^clojure.lang.PersistentVector refused refused
+                  n (.count refused)]
+              (loop [i 0 out out]
+                (if (< i n)
+                  (let [idx (long (.nth refused i))
+                        item (.nth refused (inc i))
+                        g (if (< idx pre-n) (aget pre idx) compiled-items)]
+                    (recur (+ i 2) (if g (g item (phrase l "/" idx) out) out)))
+                  out)))))))))
+
+(defn- explain-node
+  "The errors one schema node answers, compiled from the node and the location it
+   stands at. The compiled node answers FIRST: it says whether anything under it
+   refuses at all, which of its members do and whether the level's own checks are
+   clean, so the walk that names them steps only where an error is and re-asks
+   nothing that already passed. Nil where nothing under it can refuse,
+   `unexplainable` where the walking evaluator has to answer instead."
+  [schema ^String kw-loc ^String kw]
+  (cond
+    (true? schema) nil
+
+    (false? schema)
+    (let [k (or kw "falseSchema")
+          message (wording "falseSchema" nil nil)]
+      (fn [_ l out] (conj! out (error-of l kw-loc k {} message))))
+
+    (not (map? schema)) unexplainable
+
+    ;; A node with an identifier moves the base every error under it is named
+    ;; from, and an absolute location is not something this compiler tracks.
+    (contains? schema "$id") unexplainable
+
+    :else
+    (let [object-fn (explain-object-applicators explain-node schema kw-loc)
+          array-fn (explain-array-applicators explain-node schema kw-loc)
+          parts (conj (explain-value-assertions schema kw-loc)
+                      (explain-number-assertions schema kw-loc)
+                      (explain-string-assertions schema kw-loc)
+                      (explain-object-assertions schema kw-loc)
+                      (explain-array-assertions schema kw-loc))
+          compiled (::fast (meta schema))]
+      (cond
+        (some #(identical? unexplainable %) (into [object-fn array-fn] parts)) unexplainable
+        (nil? compiled) unexplainable
+        :else
+        (let [assertions (explain-chain parts)
+              ^Fast$Compiled p compiled]
+          (when (or object-fn array-fn assertions)
+            (fn [v l out]
+              (if-some [^Fast$Refusal r (.refusals p v)]
+                (let [refused (.-members r)
+                      out (if object-fn (object-fn v l out refused) out)
+                      out (if array-fn (array-fn v l out refused) out)]
+                  (if (and assertions (not (.-level r))) (assertions v l out) out))
+                out))))))))
+
+(defn- compiled-explainer
+  "The errors of a whole document as a bare function of the instance, or nil where
+   the walking evaluator has to answer it."
+  [schema]
+  (let [f (explain-node schema "" nil)]
+    (when-not (or (nil? f) (identical? unexplainable f))
+      (fn [instance]
+        (let [errors (persistent! (f instance "" (transient [])))]
+          (when (seq errors)
+            {:valid false :errors errors}))))))
 
 ;; The evaluator
 
@@ -1283,126 +1723,143 @@
             (assoc "exclusiveMinimum" (get schema "minimum")))))))
 
 (defn- eval-schema
-  [ctx schema instance]
-  (cond
-    (true? schema) ok
-    (false? schema) (err ctx {} "the false schema rejects every instance")
+  ([ctx schema instance] (eval-schema ctx schema instance false))
+  ([ctx schema instance refused]
+   (cond
+     (true? schema) ok
+     (false? schema) (err ctx {} (wording "falseSchema" nil nil))
 
     ;; A node the fast compiler took answers a VALID instance by itself: nothing
     ;; under it can be wrong, so the walk that exists to say what IS wrong never
     ;; runs.
-    (clean? ctx schema instance)
-    ok
-    (map? schema)
-    (let [km (mask schema)
+     (and (not refused) (clean? ctx schema instance))
+     ok
+     (map? schema)
+     (let [km (mask schema)
           ;; A resource reached through a reference is ALREADY at its canonical
           ;; base: resolving its own `$id` a second time would append the
           ;; relative identifier to itself (`nested/nested/foo.json`).
-          ctx (if (:id-resolved ctx)
-                (assoc ctx :id-resolved false)
-                (let [id (when (has? km m-id) (get schema "$id"))]
-                  (if (string? id)
-                    (let [b (uri/strip-fragment (uri/resolve-ref (:base ctx) id))]
-                      (-> ctx
-                          (assoc :base b :res-prefix "" :res-path [])
-                          (update :dyn-scope (fnil conj []) b)))
-                    ctx)))
-          ctx (if-let [ms (when (has? km m-dialect) (get schema "$schema"))]
-                (assoc ctx
-                       :validation? (vocabulary-validation? ctx ms)
-                       :format? (or (:format-assertion? ctx) (vocabulary-format? ctx ms))
-                       :dialect (dialects (uri/strip-fragment ms)))
-                ctx)
+           ctx (if (:id-resolved ctx)
+                 (assoc ctx :id-resolved false)
+                 (let [id (when (has? km m-id) (get schema "$id"))]
+                   (if (string? id)
+                     (let [b (uri/strip-fragment (uri/resolve-ref (:base ctx) id))]
+                       (-> ctx
+                           (assoc :base b :res-prefix "" :res-path [])
+                           (update :dyn-scope (fnil conj []) b)))
+                     ctx)))
+           ctx (if-let [ms (when (has? km m-dialect) (get schema "$schema"))]
+                 (if (identical? ms (:dialect-uri ctx))
+                   ctx
+                   (assoc ctx
+                          :validation? (vocabulary-validation? ctx ms)
+                          :format? (or (:format-assertion? ctx) (vocabulary-format? ctx ms))
+                          :dialect (dialects (uri/strip-fragment ms))
+                          :dialect-uri ms))
+                 ctx)
           ;; A legacy dialect is read through a view of the node, which the
           ;; compiler never saw and whose mask is therefore read here.
-          view (if-let [keywords (:dialect ctx)] (dialect-view keywords schema) schema)
-          km (if (identical? view schema) km (compute-mask view))
-          sl (if (identical? view schema) (slots schema) (compute-slots view))
-          schema view
-          quiet? (:quiet? ctx)
-          validation? (:validation? ctx true)
+           view (if-let [keywords (:dialect ctx)] (dialect-view keywords schema) schema)
+           km (if (identical? view schema) km (compute-mask view))
+           sl (if (identical? view schema) (slots schema) (compute-slots view))
+           schema view
+           quiet? (:quiet? ctx)
+           validation? (:validation? ctx true)
           ;; Every applicator the schema does NOT carry costs one bit test and
           ;; nothing else, and a fail-fast run stops at the first one that
           ;; refuses: `and-merge` is where both of those happen.
-          res (if (and (has? km m-ref) (string? (get schema "$ref")))
-                (and-merge quiet? ok (eval-ref eval-schema ctx schema instance))
-                ok)
-          res (if (and (has? km m-dynamic-ref) (string? (get schema "$dynamicRef")))
-                (and-merge quiet? res (eval-dynamic-ref eval-schema ctx schema instance))
-                res)
-          res (if (and (has? km m-all-of) (sequential? (get schema "allOf")))
-                (and-merge quiet? res (eval-all-of eval-schema ctx schema instance))
-                res)
-          res (if (and (has? km m-any-of) (sequential? (get schema "anyOf")))
-                (and-merge quiet? res (eval-any-of eval-schema ctx schema instance))
-                res)
-          res (if (and (has? km m-one-of) (sequential? (get schema "oneOf")))
-                (and-merge quiet? res (eval-one-of eval-schema ctx schema instance))
-                res)
-          res (if (has? km m-not)
-                (and-merge quiet? res (eval-not eval-schema ctx schema instance))
-                res)
-          res (if (has? km m-if)
-                (and-merge quiet? res (eval-conditional eval-schema ctx schema instance))
-                res)
-          res (if (and (has? km m-dependent-schemas) (map? (get schema "dependentSchemas")))
-                (and-merge quiet? res (eval-dependent-schemas eval-schema ctx schema instance))
-                res)
-          res (if (and (has? km m-dependencies) (map? (get schema "dependencies")))
-                (and-merge quiet? res (eval-dependencies eval-schema ctx schema instance))
-                res)
-          object? (map? instance)
-          array? (sequential? instance)
-          res (if (and object? (has? km m-object))
-                (and-merge quiet? res (eval-object-applicators eval-schema km sl ctx schema instance))
-                res)
-          res (if (and object? (has? km m-property-names))
-                (and-merge quiet? res (eval-property-names eval-schema ctx schema instance))
-                res)
-          res (if (and array? (has? km m-array))
-                (and-merge quiet? res (eval-array-applicators eval-schema km sl ctx schema instance))
-                res)
-          res (if (and array? (has? km m-contains))
-                (and-merge quiet? res (eval-contains validation? eval-schema ctx schema instance))
-                res)
-          res (if (and validation? (has? km m-assertions))
-                (and-merge quiet? res (eval-assertions km sl ctx instance))
-                res)
-          res (if (and (has? km m-format) (:format? ctx) (string? (get schema "format")))
-                (and-merge quiet? res (eval-format ctx schema instance))
-                res)
-          res (if (and object? (has? km m-unevaluated-props))
-                (and-merge quiet? res (eval-unevaluated-properties eval-schema ctx schema instance (:props res)))
-                res)]
-      (if (and array? (has? km m-unevaluated-items))
-        (and-merge quiet? res (eval-unevaluated-items eval-schema ctx schema instance (:items res)))
-        res))
+           res (if (and (has? km m-ref) (string? (get schema "$ref")))
+                 (and-merge quiet? ok (eval-ref eval-schema ctx schema instance))
+                 ok)
+           res (if (and (has? km m-dynamic-ref) (string? (get schema "$dynamicRef")))
+                 (and-merge quiet? res (eval-dynamic-ref eval-schema ctx schema instance))
+                 res)
+           res (if (and (has? km m-all-of) (sequential? (get schema "allOf")))
+                 (and-merge quiet? res (eval-all-of eval-schema ctx schema instance))
+                 res)
+           res (if (and (has? km m-any-of) (sequential? (get schema "anyOf")))
+                 (and-merge quiet? res (eval-any-of eval-schema ctx schema instance))
+                 res)
+           res (if (and (has? km m-one-of) (sequential? (get schema "oneOf")))
+                 (and-merge quiet? res (eval-one-of eval-schema ctx schema instance))
+                 res)
+           res (if (has? km m-not)
+                 (and-merge quiet? res (eval-not eval-schema ctx schema instance))
+                 res)
+           res (if (has? km m-if)
+                 (and-merge quiet? res (eval-conditional eval-schema ctx schema instance))
+                 res)
+           res (if (and (has? km m-dependent-schemas) (map? (get schema "dependentSchemas")))
+                 (and-merge quiet? res (eval-dependent-schemas eval-schema ctx schema instance))
+                 res)
+           res (if (and (has? km m-dependencies) (map? (get schema "dependencies")))
+                 (and-merge quiet? res (eval-dependencies eval-schema ctx schema instance))
+                 res)
+           object? (map? instance)
+           array? (sequential? instance)
+           res (if (and object? (has? km m-object))
+                 (and-merge quiet? res (eval-object-applicators eval-schema km sl ctx schema instance refused))
+                 res)
+           res (if (and object? (has? km m-property-names))
+                 (and-merge quiet? res (eval-property-names eval-schema ctx schema instance))
+                 res)
+           res (if (and array? (has? km m-array))
+                 (and-merge quiet? res (eval-array-applicators eval-schema km sl ctx schema instance refused))
+                 res)
+           res (if (and array? (has? km m-contains))
+                 (and-merge quiet? res (eval-contains validation? eval-schema ctx schema instance))
+                 res)
+           res (if (and validation? (has? km m-assertions))
+                 (and-merge quiet? res (eval-assertions km sl ctx instance))
+                 res)
+           res (if (and (has? km m-format) (:format? ctx) (string? (get schema "format")))
+                 (and-merge quiet? res (eval-format ctx schema instance))
+                 res)
+           res (if (and object? (has? km m-unevaluated-props))
+                 (and-merge quiet? res (eval-unevaluated-properties eval-schema ctx schema instance (:props res)))
+                 res)]
+       (if (and array? (has? km m-unevaluated-items))
+         (and-merge quiet? res (eval-unevaluated-items eval-schema ctx schema instance (:items res)))
+         res))
 
-    :else (throw (ex-info "a JSON Schema must be an object or a boolean"
-                          {:skjema/error :schema/invalid :value schema}))))
+     :else (throw (ex-info "a JSON Schema must be an object or a boolean"
+                           {:skjema/error :schema/invalid :value schema})))))
 
 ;; Public entry points
 
 (defn- eval-ctx
   "The evaluation context a compiled schema is validated with. It depends on
    the SCHEMA and not on the instance, so it is built once, at compile time,
-   and every validation starts from the same value."
+   and every validation starts from the same value. The dialect the ROOT
+   declares is read here for the same reason: which vocabularies a
+   meta-schema turns on is a fact about the document, and a schema that
+   declares one would otherwise pay for that lookup on every instance."
   [c quiet?]
-  (->Ctx (:index c)
-         (:dynamic c)
-         (:ref-cache c)
-         (:base c)
-         [(:base c)]
-         true
-         (:format-assertion c)
-         (:format-assertion c)
-         (:annotate? c)
-         quiet?
-         false
-         [] [] "" []
-         0
-         nil
-         nil))
+  (let [ctx (->Ctx (:index c)
+                   (:dynamic c)
+                   (:ref-cache c)
+                   (:base c)
+                   [(:base c)]
+                   true
+                   (:format-assertion c)
+                   (:format-assertion c)
+                   (:annotate? c)
+                   quiet?
+                   false
+                   [] [] "" []
+                   0
+                   nil
+                   nil
+                   nil)
+        schema (:schema c)
+        ms (when (map? schema) (get schema "$schema"))]
+    (if (string? ms)
+      (assoc ctx
+             :validation? (vocabulary-validation? ctx ms)
+             :format? (or (:format-assertion? ctx) (vocabulary-format? ctx ms))
+             :dialect (dialects (uri/strip-fragment ms))
+             :dialect-uri ms)
+      ctx)))
 
 (defn compile-schema
   "Compile and index a schema once so repeated validation does not walk its
@@ -1449,7 +1906,11 @@
               ;; once per instance.
             :ref-cache (atom {})
             :format-assertion (boolean (:format-assertion opts))}
-         compiled (assoc c :ctx (eval-ctx c false) :quiet-ctx (eval-ctx c true))
+         compiled (assoc c
+                         :ctx (eval-ctx c false)
+                         :quiet-ctx (eval-ctx c true)
+                         :fast-explainer (when (and fast? (str/blank? base))
+                                           (compiled-explainer schema)))
          meta-uri (when (map? schema) (or (get schema "$schema") official-meta-schema))
          target (when (= official-meta-schema meta-uri)
                   (get-in compiled [:index meta-uri]))
@@ -1495,14 +1956,16 @@
          ctx (:ctx c)
          schema (:schema c)]
      (if-let [^Predicate fast (:fast-validator c)]
-        ;; A passing instance is the common case and costs no error machinery:
-        ;; the compiled predicate answers it, and the evaluator runs only for
-        ;; the instances that have something to explain.
-       (fn [instance]
-         (when-not (.test fast instance)
-           (let [r (eval-schema ctx schema instance)]
-             (when-not (:valid? r)
-               {:valid false :errors (vec (:errors r))}))))
+        ;; A passing instance is the common case and costs no error machinery: the
+        ;; compiled predicate answers it, and only an instance that has something
+        ;; to explain pays for the errors it has.
+       (if-let [explain-fast (:fast-explainer c)]
+         explain-fast
+         (fn [instance]
+           (when-not (.test fast instance)
+             (let [r (eval-schema ctx schema instance true)]
+               (when-not (:valid? r)
+                 {:valid false :errors (vec (:errors r))})))))
        (fn [instance]
          (let [r (eval-schema ctx schema instance)]
            (when-not (:valid? r)

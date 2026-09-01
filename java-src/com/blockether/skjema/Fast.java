@@ -253,8 +253,38 @@ public final class Fast {
             }
             return PersistentVector.create(members);
         }
+
+        /**
+         * Null when this schema accepts the instance, otherwise what it refuses about
+         * it - the verdict, the members to look in and whether the level's own checks
+         * still have something to say - in ONE pass, because a report that has to name
+         * them must not ask the same nodes a second time.
+         */
+        public Refusal refusals(Object instance) {
+            if (objects == null && arrays == null) {
+                return node.valid(instance) ? null : new Refusal(false, PersistentVector.EMPTY);
+            }
+            ArrayList<Object> members = new ArrayList<>(4);
+            boolean level = node.valid(instance, members);
+            if (level && members.isEmpty()) return null;
+            return new Refusal(level, PersistentVector.create(members));
+        }
     }
 
+    /**
+     * What one compiled schema refuses about one instance: the members to look in,
+     * and whether the level's own checks - type, bounds, required, uniqueness - are
+     * clean. A report that knows the level is clean skips re-asking every one of them.
+     */
+    public static final class Refusal {
+        public final boolean level;
+        public final Object members;
+
+        Refusal(boolean level, Object members) {
+            this.level = level;
+            this.members = members;
+        }
+    }
     /** Where the object and array nodes of ONE schema land while it compiles. */
     private static final class Level {
         private ObjectNode objects;
@@ -263,6 +293,17 @@ public final class Fast {
 
     private interface Node {
         boolean valid(Object value);
+
+        /**
+         * Whether this node's OWN checks pass, with the members it refuses collected
+         * on the way instead of folded into the verdict - so a report knows both
+         * WHERE to walk and whether the level itself has anything left to say. Only
+         * the object and array nodes of the level a report starts from answer
+         * differently: everything else has no member to name.
+         */
+        default boolean valid(Object value, List<Object> members) {
+            return valid(value);
+        }
     }
 
     private static final class UnsupportedSchema extends RuntimeException {
@@ -314,16 +355,56 @@ public final class Fast {
     private static Node all(List<Node> checks) {
         if (checks.isEmpty()) return ANY;
         if (checks.size() == 1) return checks.get(0);
-        if (checks.size() == 2) {
-            Node first = checks.get(0);
-            Node second = checks.get(1);
-            return value -> first.valid(value) && second.valid(value);
+        if (checks.size() == 2) return new Two(checks.get(0), checks.get(1));
+        return new All(checks.toArray(new Node[0]));
+    }
+
+    /** The two checks most schemas declare, without a loop over an array of two. */
+    private static final class Two implements Node {
+        private final Node first;
+        private final Node second;
+
+        Two(Node first, Node second) {
+            this.first = first;
+            this.second = second;
         }
-        Node[] nodes = checks.toArray(new Node[0]);
-        return value -> {
+
+        @Override
+        public boolean valid(Object value) {
+            return first.valid(value) && second.valid(value);
+        }
+
+        @Override
+        public boolean valid(Object value, List<Object> members) {
+            boolean ok = first.valid(value, members);
+            return second.valid(value, members) && ok;
+        }
+    }
+
+    /** Every check one schema declared, in the order they compiled. */
+    private static final class All implements Node {
+        private final Node[] nodes;
+
+        All(Node[] nodes) {
+            this.nodes = nodes;
+        }
+
+        @Override
+        public boolean valid(Object value) {
             for (Node node : nodes) if (!node.valid(value)) return false;
             return true;
-        };
+        }
+
+        /**
+         * Every check asked, none of them skipped: a run that is answering WHERE the
+         * refusals are cannot stop at the first check that refuses.
+         */
+        @Override
+        public boolean valid(Object value, List<Object> members) {
+            boolean ok = true;
+            for (Node node : nodes) if (!node.valid(value, members)) ok = false;
+            return ok;
+        }
     }
 
     private static void addType(List<Node> checks, Object declared) {
@@ -573,6 +654,39 @@ public final class Fast {
                 if (!items.valid(array.get(i))) members.add((long) i);
             }
         }
+
+        /**
+         * Whether the array's own length and uniqueness pass, with every index whose
+         * item it refuses collected on the way.
+         */
+        @Override
+        public boolean valid(Object value, List<Object> members) {
+            List<?> array = list(value);
+            if (array == null) return true;
+            int size = array.size();
+            boolean ok = true;
+            if (max >= 0 && size > max) ok = false;
+            if (min >= 0 && size < min) ok = false;
+            if (unique && hasDuplicate(array)) ok = false;
+            int prefixed = prefixItems == null ? 0 : Math.min(prefixItems.length, size);
+            for (int i = 0; i < prefixed; i++) {
+                Object item = array.get(i);
+                if (!prefixItems[i].valid(item)) {
+                    members.add((long) i);
+                    members.add(item);
+                }
+            }
+            if (items != null) {
+                for (int i = prefixed; i < size; i++) {
+                    Object item = array.get(i);
+                    if (!items.valid(item)) {
+                        members.add((long) i);
+                        members.add(item);
+                    }
+                }
+            }
+            return ok;
+        }
     }
 
     /** Every object keyword the schema declared, one map lookup per property. */
@@ -688,6 +802,57 @@ public final class Fast {
                     if (additional == null || !additional.valid(entry.getValue())) members.add(entry.getKey());
                 }
             }
+        }
+
+        /**
+         * Whether the object's own count, required and dependency checks pass, with
+         * every member it refuses collected on the way. A level check that fails does
+         * not end the pass: the report names the missing property AND the member that
+         * is wrong.
+         */
+        @Override
+        public boolean valid(Object value, List<Object> members) {
+            if (!(value instanceof Map<?, ?> object)) return true;
+            boolean ok = true;
+            if (max >= 0 && object.size() > max) ok = false;
+            if (min >= 0 && object.size() < min) ok = false;
+            if (required != null) {
+                for (String name : required) {
+                    if (!object.containsKey(name)) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if (dependentOn != null) {
+                for (int i = 0; i < dependentOn.length; i++) {
+                    if (object.containsKey(dependentOn[i])) {
+                        for (String name : dependentNames[i]) if (!object.containsKey(name)) ok = false;
+                    }
+                }
+            }
+            if (names != null) {
+                for (int i = 0; i < names.length; i++) {
+                    Object member = lookup(object, names[i]);
+                    if (member == MISSING) {
+                        if (mandatory[i]) ok = false;
+                    } else if (!nodes[i].valid(member)) {
+                        members.add(names[i]);
+                        members.add(member);
+                    }
+                }
+            }
+            if (hasAdditional) {
+                for (Map.Entry<?, ?> entry : object.entrySet()) {
+                    if (declared == null || !declared.contains(entry.getKey())) {
+                        if (additional == null || !additional.valid(entry.getValue())) {
+                            members.add(entry.getKey());
+                            members.add(entry.getValue());
+                        }
+                    }
+                }
+            }
+            return ok;
         }
     }
 

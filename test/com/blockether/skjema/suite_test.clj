@@ -113,3 +113,30 @@
             :complete complete}))]
     (is (< 100 @checked) "the official suite did not exercise the compiled predicate")
     (is (empty? disagreements) (pr-str (take 5 disagreements)))))
+
+;; The compiled explainer is a second implementation of the same answer, so the
+;; suite holds it to the complete evaluator's own answer - every error, both
+;; locations, the params, the wording and the order - on every instance of a
+;; schema it can compile.
+(deftest compiled-explainer-matches-the-complete-evaluator
+  (let [files (json-files (io/file suite-root "tests/draft2020-12") false)
+        checked (atom 0)
+        disagreements
+        (vec
+         (for [^File file files
+               group (skjema/read-schema file)
+               :let [compiled (skjema/compile-schema (get group "schema"))]
+               :when (:fast-explainer compiled)
+               test-case (get group "tests")
+               :let [instance (get test-case "data")
+                     fast (skjema/explain compiled instance)
+                     complete (skjema/explain (assoc compiled :fast-explainer nil :fast-validator nil) instance)
+                     _ (swap! checked inc)]
+               :when (not= fast complete)]
+           {:file (.getName file)
+            :group (get group "description")
+            :test (get test-case "description")
+            :fast fast
+            :complete complete}))]
+    (is (< 100 @checked) "the official suite did not exercise the compiled explainer")
+    (is (empty? disagreements) (pr-str (take 3 disagreements)))))
