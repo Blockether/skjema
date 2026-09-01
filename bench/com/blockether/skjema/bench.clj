@@ -1,11 +1,10 @@
 (ns com.blockether.skjema.bench
   "How fast the validator is, measured against malli on the same data.
 
-   The comparison is deliberately unfair to nobody: both sides get their
-   schema PREPARED once (`skjema/compile-schema`, `m/validator`) and are then handed
-   the very same Clojure data, so what is measured is validation, not parsing
-   and not schema construction. Construction is timed separately, because a
-   caller pays it once.
+   Both sides are COMPILED before timing - `skjema/compile-schema` against
+   `m/validator`/`m/explainer` - and handed the same Clojure data, so a row
+   measures validation. Compilation itself is one row, because a caller pays
+   it once.
 
    `clojure -M:bench`, or `clojure -M:bench <case>` for one row."
   (:require [clojure.string :as str]
@@ -94,9 +93,9 @@
     :malli (let [v (m/validator user-malli-schema)] #(v bad-user))
     :expect false}
    {:id "user-errors"
-    :what "the same object, ERRORS reported (skjema BASIC output vs malli explain)"
+    :what "the same object, ERRORS reported (BASIC output vs malli explainer)"
     :skjema (let [c (skjema/compile-schema user-json-schema)] #(skjema/validate c bad-user))
-    :malli (let [s (m/schema user-malli-schema)] #(m/explain s bad-user))
+    :malli (let [e (m/explainer user-malli-schema)] #(e bad-user))
     :expect nil}
    {:id "scalar"
     :what "one string, minLength/maxLength - per-call overhead"
