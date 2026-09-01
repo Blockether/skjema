@@ -101,3 +101,17 @@
                        "params" {"missingProperty" "name"}
                        "error" "missing required property \"name\""}]}
            answer))))
+
+(deftest a-report-carries-at-most-five-errors
+  (let [schema {"type" "object"
+                "properties" (into {} (for [i (range 8)] [(str "p" i) {"type" "string"}]))}
+        instance (into {} (for [i (range 8)] [(str "p" i) i]))
+        compiled (skjema/compile-schema schema)
+        fast (skjema/explain compiled instance)
+        complete (skjema/explain (assoc compiled :fast-explainer nil :fast-validator nil)
+                                 instance)]
+    (testing "eight members are wrong and the report answers the first five of them"
+      (is (false? (:valid fast)))
+      (is (= 5 (count (:errors fast)))))
+    (testing "the compiled explainer stops where the complete evaluator was cut"
+      (is (= fast complete)))))

@@ -207,7 +207,7 @@ public final class Fast {
         try {
             Level level = new Level();
             Node node = compileNode(schema, patternCompiler, level);
-            return new Compiled(node, level.objects, level.arrays);
+            return new Compiled(node, level);
         } catch (UnsupportedSchema ignored) {
             return null;
         }
@@ -220,13 +220,19 @@ public final class Fast {
      */
     public static final class Compiled implements Predicate<Object> {
         private final Node node;
+        private final Node values;
+        private final Node numbers;
+        private final Node strings;
         private final ObjectNode objects;
         private final ArrayNode arrays;
 
-        Compiled(Node node, ObjectNode objects, ArrayNode arrays) {
+        Compiled(Node node, Level level) {
             this.node = node;
-            this.objects = objects;
-            this.arrays = arrays;
+            this.values = level.values;
+            this.numbers = level.numbers;
+            this.strings = level.strings;
+            this.objects = level.objects;
+            this.arrays = level.arrays;
         }
 
         @Override
@@ -256,54 +262,63 @@ public final class Fast {
 
         /**
          * Null when this schema accepts the instance, otherwise what it refuses about
-         * it - the verdict, the members to look in and whether the level's own checks
-         * still have something to say - in ONE pass, because a report that has to name
-         * them must not ask the same nodes a second time.
+         * it - WHICH families of check said so, and which members to look in - in ONE
+         * pass, because a report that has to name them must not ask the same nodes a
+         * second time. A family this does not name was clean and is never re-asked.
          */
         public Refusal refusals(Object instance) {
+            int refused = 0;
+            if (values != null && !values.valid(instance)) refused |= VALUE_CHECKS;
+            if (numbers != null && !numbers.valid(instance)) refused |= NUMBER_CHECKS;
+            if (strings != null && !strings.valid(instance)) refused |= STRING_CHECKS;
             if (objects == null && arrays == null) {
-                return node.valid(instance) ? null : new Refusal(false, PersistentVector.EMPTY);
+                return refused == 0 ? null : new Refusal(refused, PersistentVector.EMPTY);
             }
             ArrayList<Object> members = new ArrayList<>(4);
-            boolean level = node.valid(instance, members);
-            if (level && members.isEmpty()) return null;
-            return new Refusal(level, PersistentVector.create(members));
+            if (arrays != null && !arrays.valid(instance, members)) refused |= ARRAY_CHECKS;
+            if (objects != null && !objects.valid(instance, members)) refused |= OBJECT_CHECKS;
+            if (refused == 0 && members.isEmpty()) return null;
+            return new Refusal(refused, PersistentVector.create(members));
         }
     }
 
+    /** The families of check a schema declares, one bit each. */
+    public static final int VALUE_CHECKS = 1;
+
+    public static final int NUMBER_CHECKS = 1 << 1;
+
+    public static final int STRING_CHECKS = 1 << 2;
+
+    public static final int ARRAY_CHECKS = 1 << 3;
+
+    public static final int OBJECT_CHECKS = 1 << 4;
+
     /**
-     * What one compiled schema refuses about one instance: the members to look in,
-     * and whether the level's own checks - type, bounds, required, uniqueness - are
-     * clean. A report that knows the level is clean skips re-asking every one of them.
+     * What one compiled schema refuses about one instance: the families of check that
+     * refused, as bits, and the members to look in, each followed by its value. A
+     * report re-asks the families named here and nothing else.
      */
     public static final class Refusal {
-        public final boolean level;
+        public final int refused;
         public final Object members;
 
-        Refusal(boolean level, Object members) {
-            this.level = level;
+        Refusal(int refused, Object members) {
+            this.refused = refused;
             this.members = members;
         }
     }
-    /** Where the object and array nodes of ONE schema land while it compiles. */
+
+    /** Where the checks of ONE schema land, by family, while it compiles. */
     private static final class Level {
+        private Node values;
+        private Node numbers;
+        private Node strings;
         private ObjectNode objects;
         private ArrayNode arrays;
     }
 
     private interface Node {
         boolean valid(Object value);
-
-        /**
-         * Whether this node's OWN checks pass, with the members it refuses collected
-         * on the way instead of folded into the verdict - so a report knows both
-         * WHERE to walk and whether the level itself has anything left to say. Only
-         * the object and array nodes of the level a report starts from answer
-         * differently: everything else has no member to name.
-         */
-        default boolean valid(Object value, List<Object> members) {
-            return valid(value);
-        }
     }
 
     private static final class UnsupportedSchema extends RuntimeException {
@@ -345,11 +360,26 @@ public final class Fast {
         ArrayList<Node> checks = new ArrayList<>();
         addType(checks, source.get("type"));
         addValues(checks, source);
+        int values = checks.size();
         addNumbers(checks, source);
+        int numbers = checks.size();
         addStrings(checks, source, patternCompiler);
+        int strings = checks.size();
         addArrays(checks, source, patternCompiler, level);
         addObjects(checks, source, patternCompiler, level);
+        if (level != null) {
+            level.values = family(checks, 0, values);
+            level.numbers = family(checks, values, numbers);
+            level.strings = family(checks, numbers, strings);
+        }
         return all(checks);
+    }
+
+    /** One family of checks as a single node, or null where the schema declared none. */
+    private static Node family(List<Node> checks, int from, int to) {
+        if (from == to) return null;
+        if (to - from == 1) return checks.get(from);
+        return all(checks.subList(from, to));
     }
 
     private static Node all(List<Node> checks) {
@@ -373,12 +403,6 @@ public final class Fast {
         public boolean valid(Object value) {
             return first.valid(value) && second.valid(value);
         }
-
-        @Override
-        public boolean valid(Object value, List<Object> members) {
-            boolean ok = first.valid(value, members);
-            return second.valid(value, members) && ok;
-        }
     }
 
     /** Every check one schema declared, in the order they compiled. */
@@ -393,17 +417,6 @@ public final class Fast {
         public boolean valid(Object value) {
             for (Node node : nodes) if (!node.valid(value)) return false;
             return true;
-        }
-
-        /**
-         * Every check asked, none of them skipped: a run that is answering WHERE the
-         * refusals are cannot stop at the first check that refuses.
-         */
-        @Override
-        public boolean valid(Object value, List<Object> members) {
-            boolean ok = true;
-            for (Node node : nodes) if (!node.valid(value, members)) ok = false;
-            return ok;
         }
     }
 
@@ -659,7 +672,6 @@ public final class Fast {
          * Whether the array's own length and uniqueness pass, with every index whose
          * item it refuses collected on the way.
          */
-        @Override
         public boolean valid(Object value, List<Object> members) {
             List<?> array = list(value);
             if (array == null) return true;
@@ -810,7 +822,6 @@ public final class Fast {
          * not end the pass: the report names the missing property AND the member that
          * is wrong.
          */
-        @Override
         public boolean valid(Object value, List<Object> members) {
             if (!(value instanceof Map<?, ?> object)) return true;
             boolean ok = true;

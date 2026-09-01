@@ -1267,6 +1267,22 @@
    :params params
    :error message})
 
+(def ^:private ^:const error-limit
+  "How many errors one report carries. A reader acts on the first few and the rest
+   only cost the instance that has them, so the walk stops once it has this many
+   and every path answers the same prefix of the same reasons."
+  5)
+
+(defn- report
+  "The BASIC answer for an instance that refused, at no more than `error-limit`
+   errors."
+  [errors]
+  (let [errors (if (vector? errors) errors (vec errors))
+        n (count errors)]
+    (when (pos? n)
+      {:valid false
+       :errors (if (> n (long error-limit)) (subvec errors 0 error-limit) errors)})))
+
 (defn- member-location ^String [^String loc k]
   (phrase loc "/" (uri/escape-token (if (string? k) k (str k)))))
 
@@ -1526,7 +1542,7 @@
             (let [^clojure.lang.PersistentVector refused refused
                   n (.count refused)]
               (loop [i 0 out out]
-                (if (< i n)
+                (if (and (< i n) (< (count out) error-limit))
                   (let [k (.nth refused i)
                         member (.nth refused (inc i))]
                     (recur (+ i 2)
@@ -1572,7 +1588,7 @@
             (let [^clojure.lang.PersistentVector refused refused
                   n (.count refused)]
               (loop [i 0 out out]
-                (if (< i n)
+                (if (and (< i n) (< (count out) error-limit))
                   (let [idx (long (.nth refused i))
                         item (.nth refused (inc i))
                         g (if (< idx pre-n) (aget pre idx) compiled-items)]
@@ -1604,25 +1620,44 @@
     :else
     (let [object-fn (explain-object-applicators explain-node schema kw-loc)
           array-fn (explain-array-applicators explain-node schema kw-loc)
-          parts (conj (explain-value-assertions schema kw-loc)
-                      (explain-number-assertions schema kw-loc)
-                      (explain-string-assertions schema kw-loc)
-                      (explain-object-assertions schema kw-loc)
-                      (explain-array-assertions schema kw-loc))
+          value-parts (explain-value-assertions schema kw-loc)
+          numbers (explain-number-assertions schema kw-loc)
+          strings (explain-string-assertions schema kw-loc)
+          objects (explain-object-assertions schema kw-loc)
+          arrays (explain-array-assertions schema kw-loc)
           compiled (::fast (meta schema))]
       (cond
-        (some #(identical? unexplainable %) (into [object-fn array-fn] parts)) unexplainable
+        (some #(identical? unexplainable %)
+              (into [object-fn array-fn numbers strings objects arrays] value-parts))
+        unexplainable
+
         (nil? compiled) unexplainable
+
         :else
-        (let [assertions (explain-chain parts)
+        (let [values (explain-chain value-parts)
               ^Fast$Compiled p compiled]
-          (when (or object-fn array-fn assertions)
+          (when (or object-fn array-fn values numbers strings objects arrays)
             (fn [v l out]
               (if-some [^Fast$Refusal r (.refusals p v)]
-                (let [refused (.-members r)
-                      out (if object-fn (object-fn v l out refused) out)
-                      out (if array-fn (array-fn v l out refused) out)]
-                  (if (and assertions (not (.-level r))) (assertions v l out) out))
+                (let [refused (.-refused r)
+                      members (.-members r)
+                      out (if object-fn (object-fn v l out members) out)
+                      out (if array-fn (array-fn v l out members) out)
+                      out (if (and values (pos? (bit-and refused Fast/VALUE_CHECKS)))
+                            (values v l out)
+                            out)
+                      out (if (and numbers (pos? (bit-and refused Fast/NUMBER_CHECKS)))
+                            (numbers v l out)
+                            out)
+                      out (if (and strings (pos? (bit-and refused Fast/STRING_CHECKS)))
+                            (strings v l out)
+                            out)
+                      out (if (and objects (pos? (bit-and refused Fast/OBJECT_CHECKS)))
+                            (objects v l out)
+                            out)]
+                  (if (and arrays (pos? (bit-and refused Fast/ARRAY_CHECKS)))
+                    (arrays v l out)
+                    out))
                 out))))))))
 
 (defn- compiled-explainer
@@ -1632,9 +1667,7 @@
   (let [f (explain-node schema "" nil)]
     (when-not (or (nil? f) (identical? unexplainable f))
       (fn [instance]
-        (let [errors (persistent! (f instance "" (transient [])))]
-          (when (seq errors)
-            {:valid false :errors errors}))))))
+        (report (persistent! (f instance "" (transient []))))))))
 
 ;; The evaluator
 
@@ -1949,7 +1982,8 @@
 
 (defn explainer
   "The reasons as a bare function of the instance: nil when it validates, else
-   JSON Schema BASIC output. The counterpart of `validator` for the same schema."
+   JSON Schema BASIC output, at most five errors of it. The counterpart of
+   `validator` for the same schema."
   ([schema] (explainer schema nil))
   ([schema opts]
    (let [c (compiled schema opts)
@@ -1965,11 +1999,11 @@
            (when-not (.test fast instance)
              (let [r (eval-schema ctx schema instance true)]
                (when-not (:valid? r)
-                 {:valid false :errors (vec (:errors r))})))))
+                 (report (:errors r)))))))
        (fn [instance]
          (let [r (eval-schema ctx schema instance)]
            (when-not (:valid? r)
-             {:valid false :errors (vec (:errors r))})))))))
+             (report (:errors r)))))))))
 
 (defn validate
   "True when `instance` satisfies the schema. `validator` is the same answer
@@ -1982,6 +2016,8 @@
    `{:valid false :errors [...]}` - where every error keeps its instance and
    keyword locations and adds `:keyword` plus keyword-specific `:params`, so a
    caller can render or act on it without parsing the human `:error` string. The
-   entire answer is a JSON value."
+   entire answer is a JSON value, and it carries the first five errors of the
+   instance: a reader acts on those, and the rest only cost the walk that finds
+   them."
   ([schema instance] (explain schema instance nil))
   ([schema instance opts] ((explainer schema opts) instance)))

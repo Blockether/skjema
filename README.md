@@ -79,7 +79,9 @@ against the bundled 2020-12 meta-schema and throws `ExceptionInfo` carrying
 
 `explain` answers nil, or BASIC output locations extended with `keyword`,
 keyword-specific `params` and a readable `error`. The whole answer is a JSON
-value, so any JSON writer can render it.
+value, so any JSON writer can render it, and it carries **the first five errors**
+of the instance - a reader acts on those, and the rest only cost the walk that
+would find them.
 
 ## Verify
 
