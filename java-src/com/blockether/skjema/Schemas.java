@@ -1,6 +1,5 @@
 package com.blockether.skjema;
 
-import clojure.lang.IFn;
 import clojure.lang.ISeq;
 import clojure.lang.Numbers;
 import clojure.lang.RT;
@@ -22,191 +21,18 @@ import java.util.Set;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 
-/** The compiled validator, plus the allocation-sensitive IDN loops. */
-public final class Fast {
-    private Fast() {}
-
-    private static final int P_BASE = 36;
-    private static final int P_TMIN = 1;
-    private static final int P_TMAX = 26;
-    private static final int P_SKEW = 38;
-    private static final int P_DAMP = 700;
-    private static final int P_INITIAL_BIAS = 72;
-    private static final int P_INITIAL_N = 128;
-
-    /** Build a String from the Clojure vector used by the contextual IDN rules. */
-    public static String fromCodePoints(Object points) {
-        StringBuilder result = new StringBuilder();
-        for (ISeq seq = RT.seq(points); seq != null; seq = seq.next()) {
-            result.appendCodePoint(((Number) seq.first()).intValue());
-        }
-        return result.toString();
-    }
-
-    /** RFC 1123's allocation-free ASCII hostname path; false asks Clojure to take the IDN path. */
-    public static boolean plainAsciiHostname(String value) {
-        int n = value.length();
-        if (n < 1 || n > 253) return false;
-        int start = 0;
-        for (int i = 0; i <= n; i++) {
-            if (i == n || value.charAt(i) == '.') {
-                int len = i - start;
-                if (len < 1 || len > 63 || startsWithPunycode(value, start, i)) return false;
-                for (int j = start; j < i; j++) {
-                    char c = value.charAt(j);
-                    boolean alpha = c >= 'a' && c <= 'z';
-                    boolean digit = c >= '0' && c <= '9';
-                    boolean hyphen = c == '-' && j != start && j != i - 1;
-                    if (!(alpha || digit || hyphen)) return false;
-                }
-                start = i + 1;
-            } else if (value.charAt(i) >= 128) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private static boolean startsWithPunycode(String value, int start, int end) {
-        return end - start >= 4
-                && value.charAt(start) == 'x'
-                && value.charAt(start + 1) == 'n'
-                && value.charAt(start + 2) == '-'
-                && value.charAt(start + 3) == '-';
-    }
-
-    /** Decode one RFC 3492 Punycode body, or null when malformed. */
-    public static String punycodeDecode(String input) {
-        for (int offset = 0; offset < input.length();) {
-            int cp = input.codePointAt(offset);
-            if (cp >= 128) return null;
-            offset += Character.charCount(cp);
-        }
-        int delimiter = input.lastIndexOf('-');
-        ArrayList<Integer> output = new ArrayList<>();
-        int at;
-        if (delimiter > 0) {
-            for (int i = 0; i < delimiter; i++) output.add((int) input.charAt(i));
-            at = delimiter + 1;
-        } else {
-            at = delimiter == 0 ? 1 : 0;
-        }
-        long oldI;
-        long i = 0;
-        long n = P_INITIAL_N;
-        long bias = P_INITIAL_BIAS;
-        while (at < input.length()) {
-            oldI = i;
-            long weight = 1;
-            for (long k = P_BASE;; k += P_BASE) {
-                if (at >= input.length()) return null;
-                int digit = basicDigit(input.charAt(at++));
-                if (digit < 0 || digit > (Integer.MAX_VALUE - i) / weight) return null;
-                i += digit * weight;
-                long threshold = threshold(k, bias);
-                if (digit < threshold) break;
-                long factor = P_BASE - threshold;
-                if (weight > Integer.MAX_VALUE / factor) return null;
-                weight *= factor;
-            }
-            int length = output.size() + 1;
-            bias = adapt(i - oldI, length, oldI == 0);
-            n += i / length;
-            if (!Character.isValidCodePoint((int) n) || n < 128) return null;
-            int position = (int) (i % length);
-            output.add(position, (int) n);
-            i = position + 1L;
-        }
-        StringBuilder result = new StringBuilder(output.size());
-        for (int cp : output) result.appendCodePoint(cp);
-        return result.toString();
-    }
-
-    /** Encode one Unicode label as an RFC 3492 body, without the xn-- prefix. */
-    public static String punycodeEncode(String input) {
-        int[] points = input.codePoints().toArray();
-        StringBuilder output = new StringBuilder(points.length + 8);
-        int basic = 0;
-        for (int cp : points) {
-            if (cp < 128) {
-                output.appendCodePoint(cp);
-                basic++;
-            }
-        }
-        if (basic > 0) output.append('-');
-        long n = P_INITIAL_N;
-        long delta = 0;
-        long bias = P_INITIAL_BIAS;
-        int handled = basic;
-        while (handled < points.length) {
-            long next = Long.MAX_VALUE;
-            for (int cp : points) if (cp >= n && cp < next) next = cp;
-            if (next == Long.MAX_VALUE || next - n > (Long.MAX_VALUE - delta) / (handled + 1L)) {
-                throw new IllegalArgumentException("punycode input is too large");
-            }
-            delta += (next - n) * (handled + 1L);
-            n = next;
-            for (int cp : points) {
-                if (cp < n) {
-                    if (delta == Long.MAX_VALUE) throw new IllegalArgumentException("punycode input is too large");
-                    delta++;
-                } else if (cp == n) {
-                    long q = delta;
-                    for (long k = P_BASE;; k += P_BASE) {
-                        long t = threshold(k, bias);
-                        if (q < t) break;
-                        output.appendCodePoint(digitChar(t + ((q - t) % (P_BASE - t))));
-                        q = (q - t) / (P_BASE - t);
-                    }
-                    output.appendCodePoint(digitChar(q));
-                    bias = adapt(delta, handled + 1L, handled == basic);
-                    delta = 0;
-                    handled++;
-                }
-            }
-            delta++;
-            n++;
-        }
-        return output.toString();
-    }
-
-    private static long adapt(long delta, long points, boolean first) {
-        delta = first ? delta / P_DAMP : delta / 2;
-        delta += delta / points;
-        long k = 0;
-        while (delta > ((P_BASE - P_TMIN) * P_TMAX) / 2) {
-            delta /= P_BASE - P_TMIN;
-            k += P_BASE;
-        }
-        return k + ((P_BASE - P_TMIN + 1L) * delta) / (delta + P_SKEW);
-    }
-
-    private static long threshold(long k, long bias) {
-        long value = k - bias;
-        if (value < P_TMIN) return P_TMIN;
-        if (value > P_TMAX) return P_TMAX;
-        return value;
-    }
-
-    private static int basicDigit(int c) {
-        if (c >= '0' && c <= '9') return 26 + c - '0';
-        if (c >= 'a' && c <= 'z') return c - 'a';
-        if (c >= 'A' && c <= 'Z') return c - 'A';
-        return -1;
-    }
-
-    private static int digitChar(long digit) {
-        return (int) (digit < 26 ? 'a' + digit : '0' + digit - 26);
-    }
+/** The compiled schema: the subset of the vocabulary a check can answer on its own. */
+public final class Schemas {
+    private Schemas() {}
 
     /**
      * Compile the common assertion/applicator subset into a compiled schema.
      * Null means that an advanced keyword needs the complete Clojure evaluator.
      */
-    public static Compiled compileValidator(Object schema, IFn patternCompiler) {
+    public static Compiled compileValidator(Object schema) {
         try {
             Level level = new Level();
-            Node node = compileNode(schema, patternCompiler, level);
+            Node node = compileNode(schema, level);
             return new Compiled(node, level);
         } catch (UnsupportedSchema ignored) {
             return null;
@@ -345,11 +171,11 @@ public final class Fast {
      * An unsupported keyword aborts the whole compilation and the caller falls back
      * to the complete evaluator.
      */
-    private static Node compileNode(Object raw, IFn patternCompiler) {
-        return compileNode(raw, patternCompiler, null);
+    private static Node compileNode(Object raw) {
+        return compileNode(raw, null);
     }
 
-    private static Node compileNode(Object raw, IFn patternCompiler, Level level) {
+    private static Node compileNode(Object raw, Level level) {
         if (Boolean.TRUE.equals(raw)) return ANY;
         if (Boolean.FALSE.equals(raw)) return NONE;
         if (!(raw instanceof Map<?, ?> source)) throw new UnsupportedSchema();
@@ -363,10 +189,10 @@ public final class Fast {
         int values = checks.size();
         addNumbers(checks, source);
         int numbers = checks.size();
-        addStrings(checks, source, patternCompiler);
+        addStrings(checks, source);
         int strings = checks.size();
-        addArrays(checks, source, patternCompiler, level);
-        addObjects(checks, source, patternCompiler, level);
+        addArrays(checks, source, level);
+        addObjects(checks, source, level);
         if (level != null) {
             level.values = family(checks, 0, values);
             level.numbers = family(checks, values, numbers);
@@ -441,7 +267,7 @@ public final class Fast {
             case "boolean" -> value -> value instanceof Boolean;
             case "object" -> value -> value instanceof Map<?, ?>;
             case "array" -> value -> list(value) != null;
-            case "number" -> Fast::jsonNumber;
+            case "number" -> Schemas::jsonNumber;
             case "integer" -> value -> jsonNumber(value) && integral((Number) value);
             case "string" -> value -> value instanceof String;
             default -> throw new UnsupportedSchema();
@@ -502,7 +328,7 @@ public final class Fast {
      * code point is never more than two UTF-16 units and never fewer than one, so
      * the unit count brackets the answer.
      */
-    private static void addStrings(List<Node> checks, Map<?, ?> source, IFn patternCompiler) {
+    private static void addStrings(List<Node> checks, Map<?, ?> source) {
         Long declaredMax = nonnegativeLong(source.get("maxLength"));
         if (declaredMax != null) {
             long max = declaredMax;
@@ -526,17 +352,17 @@ public final class Fast {
             });
         }
         if (source.get("pattern") instanceof String text) {
-            Pattern pattern = (Pattern) patternCompiler.invoke(text);
+            Pattern pattern = Regex.patternOf(text);
             checks.add(value -> !(value instanceof String actual) || pattern.matcher(actual).find());
         }
     }
 
-    private static void addArrays(List<Node> checks, Map<?, ?> source, IFn patternCompiler, Level level) {
+    private static void addArrays(List<Node> checks, Map<?, ?> source, Level level) {
         Long maxItems = nonnegativeLong(source.get("maxItems"));
         Long minItems = nonnegativeLong(source.get("minItems"));
         boolean unique = Boolean.TRUE.equals(source.get("uniqueItems"));
-        List<Node> prefixItems = compileNodes(source.get("prefixItems"), patternCompiler);
-        Node items = schemaNode(source.get("items"), patternCompiler);
+        List<Node> prefixItems = compileNodes(source.get("prefixItems"));
+        Node items = schemaNode(source.get("items"));
         if (maxItems == null && minItems == null && !unique && prefixItems == null && items == null) return;
         ArrayNode node = new ArrayNode(
                 minItems == null ? -1L : minItems,
@@ -548,11 +374,11 @@ public final class Fast {
         checks.add(node);
     }
 
-    private static void addObjects(List<Node> checks, Map<?, ?> source, IFn patternCompiler, Level level) {
+    private static void addObjects(List<Node> checks, Map<?, ?> source, Level level) {
         Long maxProperties = nonnegativeLong(source.get("maxProperties"));
         Long minProperties = nonnegativeLong(source.get("minProperties"));
         String[] required = strings(source.get("required"));
-        Map<Object, Node> properties = compileProperties(source.get("properties"), patternCompiler);
+        Map<Object, Node> properties = compileProperties(source.get("properties"));
         Map<Object, String[]> dependentRequired = compileRequired(source.get("dependentRequired"));
         boolean hasAdditional = source.containsKey("additionalProperties");
         if (maxProperties == null && minProperties == null && required == null
@@ -566,7 +392,7 @@ public final class Fast {
                 properties,
                 dependentRequired,
                 hasAdditional,
-                schemaNode(source.get("additionalProperties"), patternCompiler));
+                schemaNode(source.get("additionalProperties")));
         if (level != null) level.objects = node;
         checks.add(node);
     }
@@ -867,16 +693,16 @@ public final class Fast {
         }
     }
 
-    private static Node schemaNode(Object value, IFn patternCompiler) {
+    private static Node schemaNode(Object value) {
         if (value == null) return null;
-        return compileNode(value, patternCompiler);
+        return compileNode(value);
     }
 
-    private static List<Node> compileNodes(Object value, IFn patternCompiler) {
+    private static List<Node> compileNodes(Object value) {
         List<?> values = list(value);
         if (values == null) return null;
         ArrayList<Node> result = new ArrayList<>(values.size());
-        for (Object item : values) result.add(compileNode(item, patternCompiler));
+        for (Object item : values) result.add(compileNode(item));
         return result;
     }
 
@@ -886,7 +712,7 @@ public final class Fast {
      * has to match a regular expression or walk a subtree. A valid instance meets
      * every check either way - only a refusal gets shorter.
      */
-    private static Map<Object, Node> compileProperties(Object value, IFn patternCompiler) {
+    private static Map<Object, Node> compileProperties(Object value) {
         if (!(value instanceof Map<?, ?> values)) return null;
         ArrayList<Property> ordered = new ArrayList<>(values.size());
         for (Map.Entry<?, ?> entry : values.entrySet()) {
@@ -895,7 +721,7 @@ public final class Fast {
         ordered.sort(Comparator.comparingInt(Property::cost));
         LinkedHashMap<Object, Node> result = new LinkedHashMap<>(values.size() * 2);
         for (Property property : ordered) {
-            result.put(property.name(), compileNode(property.schema(), patternCompiler));
+            result.put(property.name(), compileNode(property.schema()));
         }
         return result;
     }

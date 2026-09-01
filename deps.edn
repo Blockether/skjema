@@ -1,9 +1,9 @@
 ;; skjema — fast JSON Schema 2020-12 validation for Clojure.
-;; Charred owns JSON; Java owns allocation-sensitive validation and IDN loops.
+;; Charred owns JSON; Clojure owns the API, Java owns everything it walks over.
 {:paths ["src" "resources" "target/classes"]
  :deps/prep-lib {:alias :build
                  :fn compile-java
-                 :ensure "target/classes/com/blockether/skjema/Fast.class"}
+                 :ensure "target/classes/com/blockether/skjema/Schemas.class"}
 
  :deps {com.cnuernber/charred {:mvn/version "1.041"}}
 

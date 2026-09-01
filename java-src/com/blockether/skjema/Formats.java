@@ -614,4 +614,77 @@ public final class Formats {
             i++;
         }
     }
+
+    // Mail addresses (RFC 5321 and RFC 6531), and the one question a schema asks
+
+    /**
+     * RFC 1123, and an `xn--` label still has to be Punycode that decodes: a
+     * host name is the ASCII half of an internationalized one, not a looser
+     * grammar.
+     */
+    public static boolean hostname(String s) {
+        return ascii(s) && Idn.hostname(s);
+    }
+
+    /** A domain given as an address rather than a name: `[127.0.0.1]` or `[IPv6:::1]`. */
+    private static boolean addressLiteral(String domain) {
+        int n = domain.length();
+        if (n < 2 || domain.charAt(0) != '[' || domain.charAt(n - 1) != ']') return false;
+        String body = domain.substring(1, n - 1);
+        if (body.regionMatches(true, 0, "ipv6:", 0, 5)) return isIpv6(body, 5, body.length());
+        return isIpv4(body, 0, body.length());
+    }
+
+    /** A local part the ASCII grammar allows, at a host name or an address. */
+    public static boolean email(String s) {
+        int at = s.lastIndexOf('@');
+        if (at <= 0) return false;
+        String domain = s.substring(at + 1);
+        return mailLocal(s.substring(0, at), false)
+            && (hostname(domain) || addressLiteral(domain));
+    }
+
+    /** The same address, with the local part and the host internationalized. */
+    public static boolean idnEmail(String s) {
+        int at = s.lastIndexOf('@');
+        if (at <= 0) return false;
+        String domain = s.substring(at + 1);
+        return mailLocal(s.substring(0, at), true)
+            && (Idn.hostname(domain) || addressLiteral(domain));
+    }
+
+    /**
+     * Whether `instance` satisfies `format`. An unknown format is satisfied by
+     * every string - the specification requires that and callers rely on it -
+     * and so is every instance that is not a string at all.
+     */
+    public static boolean valid(Object format, Object instance) {
+        if (!(format instanceof String name) || !(instance instanceof String s)) return true;
+        try {
+            return switch (name) {
+                case "date" -> date(s);
+                case "date-time" -> dateTime(s);
+                case "time" -> time(s);
+                case "duration" -> duration(s);
+                case "email" -> email(s);
+                case "idn-email" -> idnEmail(s);
+                case "hostname" -> hostname(s);
+                case "idn-hostname" -> Idn.hostname(s);
+                case "ipv4" -> ipv4(s);
+                case "ipv6" -> ipv6(s);
+                case "uri" -> uri(s);
+                case "uri-reference" -> uriReference(s);
+                case "iri" -> iri(s);
+                case "iri-reference" -> iriReference(s);
+                case "uri-template" -> uriTemplate(s);
+                case "uuid" -> uuid(s);
+                case "json-pointer" -> jsonPointer(s);
+                case "relative-json-pointer" -> relativeJsonPointer(s);
+                case "regex" -> Regex.ecma(s);
+                default -> true;
+            };
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+    }
 }

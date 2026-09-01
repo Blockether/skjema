@@ -26,11 +26,9 @@
    caller did not supply is a compile error, not a silent pass."
   (:require [charred.api :as charred]
             [clojure.java.io :as io]
-            [clojure.string :as str]
-            [com.blockether.skjema.format :as fmt]
-            [com.blockether.skjema.regex :as regex]
-            [com.blockether.skjema.uri :as uri])
-  (:import (com.blockether.skjema Fast Fast$Compiled Fast$Refusal Prose)
+            [clojure.string :as str])
+  (:import (com.blockether.skjema Formats Prose Regex Schemas Schemas$Compiled
+                                  Schemas$Refusal Uri)
            (java.math BigDecimal)
            (java.nio.file Path)
            (java.util.function Predicate)))
@@ -423,13 +421,13 @@
                     :else acc))
                 x
                 x)]
-      (if-let [p (Fast/compileValidator node regex/pattern-of)]
-        (vary-meta node assoc ::fast p)
+      (if-let [p (Schemas/compileValidator node)]
+        (vary-meta node assoc ::compiled p)
         node))))
 (defn- compile-pattern! [location pattern]
   (when (string? pattern)
     (try
-      (regex/pattern-of pattern)
+      (Regex/patternOf pattern)
       (catch java.util.regex.PatternSyntaxException t
         (throw (ex-info (str "invalid regular expression at " location ": "
                              (.getDescription t))
@@ -446,7 +444,7 @@
     (let [_ (compile-pattern! (str ptr "/pattern") (get schema "pattern"))
           id (get schema "$id")
           resource? (string? id)
-          base (if resource? (uri/strip-fragment (uri/resolve-ref base id)) base)
+          base (if resource? (Uri/stripFragment (Uri/resolveRef base id)) base)
           ptr (if resource? "" ptr)
           entry {:schema schema :base base :ptr ptr}
           acc (cond-> acc
@@ -461,7 +459,7 @@
                 acc)]
       (reduce-kv
        (fn [acc k v]
-         (let [kptr (str ptr "/" (uri/escape-token k))]
+         (let [kptr (str ptr "/" (Uri/escapeToken k))]
            (cond
              (subschema-keywords k)
              (index-schema (cond-> acc (unevaluated-keywords k) (assoc :unevaluated? true))
@@ -476,8 +474,8 @@
              (and (subschema-map-keywords k) (map? v))
              (reduce-kv (fn [acc kk sub]
                           (when (= k "patternProperties")
-                            (compile-pattern! (str kptr "/" (uri/escape-token kk)) kk))
-                          (index-schema acc sub base (str kptr "/" (uri/escape-token kk))))
+                            (compile-pattern! (str kptr "/" (Uri/escapeToken kk)) kk))
+                          (index-schema acc sub base (str kptr "/" (Uri/escapeToken kk))))
                         acc
                         v)
 
@@ -489,7 +487,7 @@
   "Walk a JSON Pointer fragment inside one resource, tracking a nested `$id` so
    the answer knows which resource it ended up in."
   [{:keys [schema base ptr]} pointer]
-  (loop [node schema base base ptr ptr tokens (uri/pointer-tokens pointer)]
+  (loop [node schema base base ptr ptr tokens (Uri/pointerTokens pointer)]
     (if (empty? tokens)
       {:schema node :base base :ptr ptr}
       (let [t (first tokens)
@@ -504,8 +502,8 @@
           (let [id (when (map? child) (get child "$id"))
                 resource? (string? id)]
             (recur child
-                   (if resource? (uri/strip-fragment (uri/resolve-ref base id)) base)
-                   (if resource? "" (str ptr "/" (uri/escape-token t)))
+                   (if resource? (Uri/stripFragment (Uri/resolveRef base id)) base)
+                   (if resource? "" (str ptr "/" (Uri/escapeToken t)))
                    (rest tokens))))))))
 
 (defn- lookup
@@ -514,8 +512,8 @@
   [ctx ^String uri]
   (let [uri (if (str/ends-with? uri "#") (subs uri 0 (dec (count uri))) uri)]
     (or (get (:index ctx) uri)
-        (let [resource (get (:index ctx) (uri/strip-fragment uri))
-              frag (uri/fragment uri)]
+        (let [resource (get (:index ctx) (Uri/stripFragment uri))
+              frag (Uri/fragment uri)]
           (when resource
             (cond
               (or (nil? frag) (= "" frag)) resource
@@ -561,7 +559,7 @@
   [ctx sub instance]
   (and (not (:annotate? ctx))
        (map? sub)
-       (when-some [^Predicate p (::fast (.meta ^clojure.lang.IObj sub))] (.test p instance))))
+       (when-some [^Predicate p (::compiled (.meta ^clojure.lang.IObj sub))] (.test p instance))))
 (defn- dirty-members
   "The members of `instance` the schema's own compiled checks refuse, or nil when
    it has no compiled answer about them. A report told which two of nine members
@@ -569,7 +567,7 @@
    annotations has to visit every member anyway."
   [ctx schema instance]
   (when-not (:annotate? ctx)
-    (when-some [^Fast$Compiled c (::fast (.meta ^clojure.lang.IObj schema))]
+    (when-some [^Schemas$Compiled c (::compiled (.meta ^clojure.lang.IObj schema))]
       (.dirty c instance))))
 
 (defn- quiet
@@ -590,7 +588,7 @@
       (reduce (fn [^StringBuilder sb t]
                 (-> sb
                     (.append "/")
-                    (.append (uri/escape-token (if (string? t) t (str t))))))
+                    (.append (Uri/escapeToken (if (string? t) t (str t))))))
               sb
               tokens)
       (.toString sb))))
@@ -709,7 +707,7 @@
         ;; every instance, and resolution is string work: cache it per compiled
         ;; schema, keyed by the base it was resolved against.
         target (or (get @cache [base ref])
-                   (let [uri (uri/resolve-ref base ref)
+                   (let [uri (Uri/resolveRef base ref)
                          t (lookup ctx uri)]
                      (when-not t
                        (throw (ex-info (str "cannot resolve $ref " (pr-str ref))
@@ -725,9 +723,9 @@
    caller's own definition take over from the one it was written against."
   [f ctx schema instance]
   (let [ref (get schema "$dynamicRef")
-        uri (uri/resolve-ref (:base ctx) ref)
+        uri (Uri/resolveRef (:base ctx) ref)
         static (lookup ctx uri)
-        frag (uri/fragment uri)
+        frag (Uri/fragment uri)
         anchor? (and frag (not (str/starts-with? frag "/")))
         dynamic (when (and anchor?
                            (or (nil? static)
@@ -829,7 +827,7 @@
   "Assert a format only where the format-assertion vocabulary is in force."
   [ctx schema instance]
   (let [f (get schema "format")]
-    (if (fmt/valid? f instance)
+    (if (Formats/valid f instance)
       ok
       (err (at-keyword ctx "format") {:format f}
            (str "the string is not a valid " f)))))
@@ -924,7 +922,7 @@
                           res)
                     matched (when patterns?
                               (reduce-kv (fn [acc p sub]
-                                           (if (re-find (regex/pattern-of p) k)
+                                           (if (re-find (Regex/patternOf p) k)
                                              (conj acc [p sub])
                                              acc))
                                          []
@@ -1106,7 +1104,7 @@
                                   {:limit min-length :actual length}
                                   (wording "minLength" min-length length)))
               res)]
-    (if (and (string? pattern) (not (re-find (regex/pattern-of pattern) instance)))
+    (if (and (string? pattern) (not (re-find (Regex/patternOf pattern) instance)))
       (merge-res res (err (at-keyword ctx "pattern")
                           {:pattern pattern}
                           (wording "pattern" pattern nil)))
@@ -1261,7 +1259,7 @@
        :errors (if (> n (long error-limit)) (subvec errors 0 error-limit) errors)})))
 
 (defn- member-location ^String [^String loc k]
-  (Prose/member loc (uri/escape-token (if (string? k) k (str k)))))
+  (Prose/member loc (Uri/escapeToken (if (string? k) k (str k)))))
 
 (defn- explain-chain
   "The checks of one node as a single function, in the order the walking evaluator
@@ -1349,7 +1347,7 @@
             (when (string? pattern)
               (let [kl (str kw-loc "/pattern")
                     params {:pattern pattern}
-                    p (regex/pattern-of pattern)]
+                    p (Regex/patternOf pattern)]
                 (fn [v l out]
                   (if (re-find p v)
                     out
@@ -1496,10 +1494,10 @@
                  (reduce-kv (fn [acc k sub]
                               (if (identical? unexplainable acc)
                                 acc
-                                (let [child (f sub (str kw-loc "/properties/" (uri/escape-token k)) "properties")]
+                                (let [child (f sub (str kw-loc "/properties/" (Uri/escapeToken k)) "properties")]
                                   (if (identical? unexplainable child)
                                     unexplainable
-                                    (assoc acc k [(str "/" (uri/escape-token k)) child])))))
+                                    (assoc acc k [(str "/" (Uri/escapeToken k)) child])))))
                             {}
                             props))
         extra (when additional?
@@ -1602,7 +1600,7 @@
           strings (explain-string-assertions schema kw-loc)
           objects (explain-object-assertions schema kw-loc)
           arrays (explain-array-assertions schema kw-loc)
-          compiled (::fast (meta schema))]
+          compiled (::compiled (meta schema))]
       (cond
         (some #(identical? unexplainable %)
               (into [object-fn array-fn numbers strings objects arrays] value-parts))
@@ -1612,27 +1610,27 @@
 
         :else
         (let [values (explain-chain value-parts)
-              ^Fast$Compiled p compiled]
+              ^Schemas$Compiled p compiled]
           (when (or object-fn array-fn values numbers strings objects arrays)
             (fn [v l out]
-              (if-some [^Fast$Refusal r (.refusals p v)]
+              (if-some [^Schemas$Refusal r (.refusals p v)]
                 (let [refused (.-refused r)
                       members (.-members r)
                       out (if object-fn (object-fn v l out members) out)
                       out (if array-fn (array-fn v l out members) out)
-                      out (if (and values (pos? (bit-and refused Fast/VALUE_CHECKS)))
+                      out (if (and values (pos? (bit-and refused Schemas/VALUE_CHECKS)))
                             (values v l out)
                             out)
-                      out (if (and numbers (pos? (bit-and refused Fast/NUMBER_CHECKS)))
+                      out (if (and numbers (pos? (bit-and refused Schemas/NUMBER_CHECKS)))
                             (numbers v l out)
                             out)
-                      out (if (and strings (pos? (bit-and refused Fast/STRING_CHECKS)))
+                      out (if (and strings (pos? (bit-and refused Schemas/STRING_CHECKS)))
                             (strings v l out)
                             out)
-                      out (if (and objects (pos? (bit-and refused Fast/OBJECT_CHECKS)))
+                      out (if (and objects (pos? (bit-and refused Schemas/OBJECT_CHECKS)))
                             (objects v l out)
                             out)]
-                  (if (and arrays (pos? (bit-and refused Fast/ARRAY_CHECKS)))
+                  (if (and arrays (pos? (bit-and refused Schemas/ARRAY_CHECKS)))
                     (arrays v l out)
                     out))
                 out))))))))
@@ -1753,7 +1751,7 @@
                  (assoc ctx :id-resolved false)
                  (let [id (when (has? km m-id) (get schema "$id"))]
                    (if (string? id)
-                     (let [b (uri/strip-fragment (uri/resolve-ref (:base ctx) id))]
+                     (let [b (Uri/stripFragment (Uri/resolveRef (:base ctx) id))]
                        (-> ctx
                            (assoc :base b :res-prefix "" :res-path [])
                            (update :dyn-scope (fnil conj []) b)))
@@ -1764,7 +1762,7 @@
                    (assoc ctx
                           :validation? (vocabulary-validation? ctx ms)
                           :format? (or (:format-assertion? ctx) (vocabulary-format? ctx ms))
-                          :dialect (dialects (uri/strip-fragment ms))
+                          :dialect (dialects (Uri/stripFragment ms))
                           :dialect-uri ms))
                  ctx)
           ;; A legacy dialect is read through a view of the node, which the
@@ -1867,7 +1865,7 @@
       (assoc ctx
              :validation? (vocabulary-validation? ctx ms)
              :format? (or (:format-assertion? ctx) (vocabulary-format? ctx ms))
-             :dialect (dialects (uri/strip-fragment ms))
+             :dialect (dialects (Uri/stripFragment ms))
              :dialect-uri ms)
       ctx)))
 
@@ -1877,7 +1875,7 @@
    documents are resolved only from the supplied registry."
   ([schema] (compile-schema schema nil))
   ([schema opts]
-   (let [base (uri/strip-fragment (or (:base opts) ""))
+   (let [base (Uri/stripFragment (or (:base opts) ""))
          registry (update-vals (merge @bundled-meta-schemas (:registry opts)) with-masks)
          acc (reduce-kv (fn [acc uri doc]
                           (-> acc
@@ -1897,7 +1895,7 @@
          schema (if fast? (with-fast schema) schema)
          acc (index-schema acc schema base "")
          root-base (if (and (map? schema) (string? (get schema "$id")))
-                     (uri/strip-fragment (uri/resolve-ref base (get schema "$id")))
+                     (Uri/stripFragment (Uri/resolveRef base (get schema "$id")))
                      base)
          acc (update acc :index #(assoc % base {:schema schema :base root-base :ptr ""}
                                         root-base {:schema schema :base root-base :ptr ""}))
@@ -1934,7 +1932,7 @@
                               (or (not-empty (:instanceLocation first-error)) "/")
                               ": " (:error first-error))
                          {:skjema/error :schema/invalid :errors errors}))))
-     (assoc compiled :fast-validator (::fast (meta schema))))))
+     (assoc compiled :fast-validator (::compiled (meta schema))))))
 
 (defn compiled-schema? [x] (boolean (:skjema/compiled x)))
 
