@@ -30,7 +30,7 @@
             [com.blockether.skjema.format :as fmt]
             [com.blockether.skjema.regex :as regex]
             [com.blockether.skjema.uri :as uri])
-  (:import (com.blockether.skjema Fast Fast$Compiled Fast$Refusal)
+  (:import (com.blockether.skjema Fast Fast$Compiled Fast$Refusal Prose)
            (java.math BigDecimal)
            (java.nio.file Path)
            (java.util.function Predicate)))
@@ -834,54 +834,31 @@
       (err (at-keyword ctx "format") {:format f}
            (str "the string is not a valid " f)))))
 
-(defn- phrase
-  "The words of one error, appended in place. `clojure.core/str` walks a sequence
-   from its third argument onwards, and an explained instance pays for that on
-   every error it answers, so the prose of a refusal is built here instead."
-  (^String [a b c]
-   (.toString (doto (StringBuilder. 48)
-                (.append ^String (str a))
-                (.append ^String (str b))
-                (.append ^String (str c)))))
-  (^String [a b c d]
-   (.toString (doto (StringBuilder. 64)
-                (.append ^String (str a))
-                (.append ^String (str b))
-                (.append ^String (str c))
-                (.append ^String (str d)))))
-  (^String [a b c d e]
-   (.toString (doto (StringBuilder. 64)
-                (.append ^String (str a))
-                (.append ^String (str b))
-                (.append ^String (str c))
-                (.append ^String (str d))
-                (.append ^String (str e))))))
-
 (defn- wording
   "The prose one refused keyword answers: `a` is what the schema said, `b` is what
    the instance is. The walking evaluator and the compiled explainer both word a
    refusal here, so neither can drift away from the other."
   [^String kw a b]
   (case kw
-    "type" (phrase "expected " (str/join " or " a) ", got " (json-type b))
+    "type" (Prose/words "expected " (str/join " or " a) ", got " (json-type b))
     "enum" "the instance is not one of the enumerated values"
     "const" (str "the instance is not the constant " (json-str a))
-    "multipleOf" (phrase b " is not a multiple of " a)
-    "maximum" (phrase b " is greater than the maximum " a)
-    "exclusiveMaximum" (phrase b " is not below the exclusive maximum " a)
-    "minimum" (phrase b " is less than the minimum " a)
-    "exclusiveMinimum" (phrase b " is not above the exclusive minimum " a)
-    "maxLength" (phrase "the string is " b " characters long, the maximum is " a)
-    "minLength" (phrase "the string is " b " characters long, the minimum is " a)
+    "multipleOf" (Prose/words b " is not a multiple of " a)
+    "maximum" (Prose/words b " is greater than the maximum " a)
+    "exclusiveMaximum" (Prose/words b " is not below the exclusive maximum " a)
+    "minimum" (Prose/words b " is less than the minimum " a)
+    "exclusiveMinimum" (Prose/words b " is not above the exclusive minimum " a)
+    "maxLength" (Prose/words "the string is " b " characters long, the maximum is " a)
+    "minLength" (Prose/words "the string is " b " characters long, the minimum is " a)
     "pattern" (str "the string does not match the pattern " (pr-str a))
-    "maxItems" (phrase "the array has " b " items, the maximum is " a)
-    "minItems" (phrase "the array has " b " items, the minimum is " a)
-    "uniqueItems" (phrase "items " a " and " b " are duplicates")
-    "maxProperties" (phrase "the object has " b " properties, the maximum is " a)
-    "minProperties" (phrase "the object has " b " properties, the minimum is " a)
+    "maxItems" (Prose/words "the array has " b " items, the maximum is " a)
+    "minItems" (Prose/words "the array has " b " items, the minimum is " a)
+    "uniqueItems" (Prose/words "items " a " and " b " are duplicates")
+    "maxProperties" (Prose/words "the object has " b " properties, the maximum is " a)
+    "minProperties" (Prose/words "the object has " b " properties, the minimum is " a)
     "required" (str "missing required property " (pr-str a))
-    "dependentRequired" (phrase "property " (pr-str a) " requires " (pr-str b))
-    "additionalProperties" (phrase "additional property " (pr-str a) " is not allowed")
+    "dependentRequired" (Prose/words "property " (pr-str a) " requires " (pr-str b))
+    "additionalProperties" (Prose/words "additional property " (pr-str a) " is not allowed")
     "falseSchema" "the false schema rejects every instance"))
 
 ;; Child applicators
@@ -1284,7 +1261,7 @@
        :errors (if (> n (long error-limit)) (subvec errors 0 error-limit) errors)})))
 
 (defn- member-location ^String [^String loc k]
-  (phrase loc "/" (uri/escape-token (if (string? k) k (str k)))))
+  (Prose/member loc (uri/escape-token (if (string? k) k (str k)))))
 
 (defn- explain-chain
   "The checks of one node as a single function, in the order the walking evaluator
@@ -1592,7 +1569,7 @@
                   (let [idx (long (.nth refused i))
                         item (.nth refused (inc i))
                         g (if (< idx pre-n) (aget pre idx) compiled-items)]
-                    (recur (+ i 2) (if g (g item (phrase l "/" idx) out) out)))
+                    (recur (+ i 2) (if g (g item (Prose/index l idx) out) out)))
                   out)))))))))
 
 (defn- explain-node

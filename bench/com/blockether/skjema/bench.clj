@@ -70,6 +70,15 @@
 (def numbers-malli-schema [:vector [:int {:min 0 :max 1000}]])
 (def numbers (vec (range 1000)))
 
+(def items-json-schema
+  {"type" "array" "items" {"type" "string" "minLength" 1}})
+(def items-malli-schema [:vector [:string {:min 1}]])
+(def bad-items
+  "Twenty strings, every fourth of them empty: the item walk a report has to make.
+   `user-errors` cannot measure it - its `tags` is empty, so `minItems` answers
+   before any item is looked at."
+  (mapv (fn [i] (if (zero? (rem (inc (long i)) 4)) "" (str "tag" i))) (range 20)))
+
 ;; --- measurement ------------------------------------------------------------
 
 (defn- mean-ns ^double [f]
@@ -101,6 +110,11 @@
     :what "the same object VALID, errors asked for anyway - the common case"
     :skjema (let [e (skjema/explainer user-json-schema)] #(e user))
     :malli (let [e (m/explainer user-malli-schema)] #(e user))
+    :expect nil}
+   {:id "array-errors"
+    :what "array of 20 items, every fourth wrong - the ITEM walk, ERRORS reported"
+    :skjema (let [e (skjema/explainer items-json-schema)] #(e bad-items))
+    :malli (let [e (m/explainer items-malli-schema)] #(e bad-items))
     :expect nil}
    {:id "scalar"
     :what "one string, minLength/maxLength - per-call overhead"
