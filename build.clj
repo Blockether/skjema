@@ -1,5 +1,5 @@
 (ns build
-  "Build/deploy for skjema. One small jar of pure Clojure, no dependencies."
+  "Build/deploy for skjema. Clojure owns semantics; Java owns hot loops."
   (:require [clojure.string :as str]
             [clojure.tools.build.api :as b]
             [deps-deploy.deps-deploy :as dd]))
@@ -31,13 +31,22 @@
                       {:release release :declared declared-version})))))
 
 (def class-dir "target/classes")
+(def java-src-dir "java-src")
 (def jar-file (format "target/%s.jar" (name lib)))
 (def basis (delay (b/create-basis {:project "deps.edn"})))
 
 (defn clean [_] (b/delete {:path "target"}))
 
+(defn compile-java
+  "Compile the allocation-sensitive scanners and validators for a source checkout."
+  [_]
+  (b/javac {:src-dirs [java-src-dir]
+            :class-dir class-dir
+            :basis @basis
+            :javac-opts ["--release" "21" "-Xlint:all" "-Werror"]}))
+
 (defn- pom-data []
-  [[:description "JSON Schema 2020-12 validation for Clojure. No dependencies, no reflection, native-image safe."]
+  [[:description "Fast JSON Schema 2020-12 validation for Clojure, powered by charred."]
    [:url "https://github.com/Blockether/skjema"]
    [:licenses [:license [:name "MIT License"] [:url "https://opensource.org/licenses/MIT"]]]
    [:scm [:url "https://github.com/Blockether/skjema"]
@@ -47,11 +56,12 @@
 (defn jar [_]
   (check-version!)
   (clean nil)
+  (compile-java nil)
   (b/write-pom {:class-dir class-dir
                 :lib lib
                 :version version
                 :basis @basis
-                :src-dirs ["src"]
+                :src-dirs ["src" java-src-dir]
                 :pom-data (pom-data)})
   (b/copy-dir {:src-dirs ["src" "resources"] :target-dir class-dir})
   ;; MIT asks that the notice travel with every copy, so the jar carries the
@@ -60,8 +70,7 @@
   (b/copy-file {:src "NOTICE" :target (str class-dir "/META-INF/NOTICE")})
   (b/jar {:class-dir class-dir :jar-file jar-file})
   ;; The bundled 2020-12 meta-schemas live in `resources/`, and a jar without
-  ;; them throws on the first `compile` in every consumer — which is exactly how
-  ;; 0.1.0 shipped. The build refuses to hand out an artifact that cannot validate.
+  ;; them throws on the first `compile-schema` call. The build refuses such artifacts.
   (let [entry "com/blockether/skjema/meta/2020-12/schema.json"]
     (with-open [zip (java.util.zip.ZipFile. (java.io.File. ^String jar-file))]
       (when-not (.getEntry zip entry)

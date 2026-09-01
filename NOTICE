@@ -7,9 +7,8 @@ The specification implemented here is JSON Schema 2020-12
 (https://json-schema.org/specification), published by the JSON Schema
 organization under the MIT-like terms of its own repositories.
 
-Conformance is measured against json-schema-org/JSON-Schema-Test-Suite and
-nst/JSONTestSuite, vendored under test/resources; both carry their own MIT
-licenses, reproduced beside the vendored files.
+Conformance is measured against json-schema-org/JSON-Schema-Test-Suite,
+vendored under test/resources with its MIT license reproduced beside it.
 
 No code was copied from any existing validator: this is an independent Clojure
 implementation of the specification.

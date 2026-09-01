@@ -1,138 +1,70 @@
 # skjema
 
-**JSON Schema 2020-12 validation for Clojure.** No dependencies, no reflection,
-native-image safe. `skjema` is Norwegian for *schema*.
+Fast JSON Schema 2020-12 validation for Clojure. `skjema` is Norwegian for
+*schema*.
 
 ```clojure
-com.blockether/skjema {:mvn/version "0.1.0"}
+com.blockether/skjema {:mvn/version "0.2.0"}
 ```
-
-## Why another validator
-
-Every JVM validator worth using binds Jackson `databind`, which means reflection
-and a reachability-metadata chase in a GraalVM native image, plus a JSON stack a
-consumer did not choose. `skjema` binds nothing:
-
-- **Schemas are JSON.** Written as `.json`, copied straight from the
-  specification or the test suite, readable by every other tool that speaks
-  JSON Schema. No EDN dialect, no translation layer, no drift test between the
-  two spellings.
-- **Validation works on parsed data.** `compile` indexes a schema once;
-  `validate` walks the instance, not the schema map. The instance may come
-  from `skjema.json`, from charred, from anywhere — it is plain Clojure data.
-- **Errors preserve BASIC output and add actionability.** Every error carries the
-  standard `instanceLocation`, `keywordLocation`, optional
-  `absoluteKeywordLocation`, and `error`; `keyword` plus keyword-specific
-  `params` let a UI act without parsing English. The whole answer remains JSON.
 
 ## Use
 
 ```clojure
-(require '[com.blockether.skjema.core :as skjema]
-         '[com.blockether.skjema.json :as json])
+(require '[com.blockether.skjema.core :as skjema])
 
-(def schema (json/read-str (slurp "user.schema.json")))
+(def schema
+  (skjema/read-schema (java.nio.file.Path/of "user.schema.json" (make-array String 0))))
 
-(skjema/valid? schema {"name" "Ada"})
+(def validator (skjema/compile-schema schema))
+
+(skjema/valid? validator {"name" "Ada"})
 ;; => true
 
-(skjema/validate schema {"name" 42})
+(skjema/validate validator {"name" 42})
 ;; => {:valid false
 ;;     :errors [{:instanceLocation "/name"
 ;;               :keywordLocation "/properties/name/type"
-;;               :absoluteKeywordLocation "https://example.com/user.json#/properties/name/type"
 ;;               :keyword "type"
 ;;               :params {:type "string"}
 ;;               :error "expected string, got integer"}]}
-
-(json/write-str (skjema/validate schema {"name" 42}))
-;; => BASIC output locations plus machine-readable keyword and params
 ```
 
-`compile` once when the schema is reused, and hand it whatever it references —
-nothing is ever fetched:
+`read-schema` accepts JSON text, `Path`, `File`, URL/classpath resource,
+`InputStream`, or `Reader`. `write-schema` returns compact JSON text. Both use
+[charred](https://github.com/cnuernber/charred).
+
+Compile once when a schema is reused. References are resolved from an explicit
+registry; skjema never fetches them:
 
 ```clojure
-(def compiled (skjema/compile schema {:base "https://example.com/user.json"
-                                      :registry {"https://example.com/tag.json" tag-schema}}))
-(skjema/valid? compiled instance)
+(def validator
+  (skjema/compile-schema schema
+    {:base "https://example.com/user.json"
+     :registry {"https://example.com/tag.json" tag-schema}
+     :format-assertion true}))
 ```
 
-A document that references its neighbours by relative path works the same way:
-the registry decides what a name means, so the schemas can live in
-`resources/` and be read with `io/resource` — this library reads nothing off
-the filesystem and opens no socket. A reference nobody supplied is a `compile`
-error, never a silent pass:
+## Errors
 
-```clojure
-(def registry
-  (into {} (for [n ["node.json" "action.json"]]
-             [n (json/read-str (slurp (io/resource (str "contract/" n))))])))
+`validate` returns JSON Schema BASIC output locations and adds `keyword`,
+keyword-specific `params`, and a human-readable `error`. A successful result is
+`{:valid true}`. Parsing, compilation, and writing throw `ExceptionInfo` with a
+`:skjema/error` category and preserve the original cause.
 
-(skjema/compile view-schema {:base "view.json" :registry registry})
-;; "$ref": "node.json" inside it resolves against the base, to the registry key
+## Verification
+
+The suite covers all required and optional draft 2020-12 cases from the official
+JSON-Schema-Test-Suite. Java owns the compiled validation and IDN hot loops;
+Clojure owns complete evaluation and structured errors.
+
+```bash
+clojure -M:test
+clojure -M:bench
 ```
 
-The 2020-12 meta-schemas ARE read from this jar's own resources, and the jar
-carries the `META-INF/native-image` metadata that registers them — a consumer
-builds a GraalVM native image without knowing that.
-`format` annotates rather than asserts, which is what the specification says by
-default. Ask for the assertion — every format 2020-12 names is implemented,
-`date-time` through `idn-hostname` — with an option, or by declaring the
-format-assertion vocabulary in a meta-schema:
+The benchmark prepares both schemas before timing validation. Run it on the
+machine and JVM that matter to your workload.
 
-```clojure
-(skjema/valid? {"format" "idn-hostname"} "\u5b9f\u4f8b.\u30c6\u30b9\u30c8" {:format-assertion true})
-```
-
-## Status
-
-Green, and the gate says what that means:
-
-- **1299 assertions** of the official
-  [JSON-Schema-Test-Suite](https://github.com/json-schema-org/JSON-Schema-Test-Suite)
-  for draft 2020-12, every required file.
-- **1012 assertions** of that suite's `optional/` files — the formats, the
-  ECMAScript regular expressions, arbitrary-precision numbers, the draft-07
-  `dependencies`, and a reference that crosses into an older draft.
-- **318/318** files of [JSONTestSuite](https://github.com/nst/JSONTestSuite)
-  for the reader (`y_` accepted, `n_` refused, `i_` answered).
-- Zero reflection warnings, zero dependencies.
-
-Two things the suite does not ask for and this library does not do: it never
-fetches a document over the network, and it evaluates the 2020-12 dialect —
-a resource that declares 2019-09, draft-07, draft-06 or draft-04 is read with
-the keywords THAT draft defines, so `$recursiveRef` is recognized without being
-followed.
-
-## Speed
-
-`clojure -M:bench` measures the same data against
-[malli](https://github.com/metosin/malli), both sides prepared once, with
-criterium. One machine's medians — run it on yours:
-
-| what | skjema | malli |
-|---|---|---|
-| object of 9 members, valid | 2.8 us | 0.32 us |
-| the same object, two members wrong | 0.75 us | 0.11 us |
-| the same object, errors reported | 5.0 us | 0.58 us |
-| one string, `minLength`/`maxLength` | 110 ns | 13 ns |
-| array of 1000 integers with bounds | 100 us | 8.3 us |
-| preparing the schema itself | 35 us | 5.3 us |
-
-malli compiles a schema written in its own language down to closures; `skjema`
-walks a JSON document the specification defines keyword by keyword, and stays
-within an order of magnitude of it. What it costs is decided when the schema is
-compiled, never per instance:
-
-- every node carries a **bitmask of the keywords it holds**, so a node is asked
-  about the twenty-odd keywords it does NOT carry with one bit test and no map
-  lookup;
-- `valid?` is **fail-fast and location-free** — it stops at the first refusal
-  and never builds the JSON Pointers only an error would print;
-- **annotations are built only for a document that says `unevaluatedProperties`
-  or `unevaluatedItems`**, because nothing else can read them;
-- `$ref` resolution is cached per compiled schema.
 ## License
 
 MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE).

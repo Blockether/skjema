@@ -5,7 +5,6 @@
    machine-readable fields callers otherwise have to scrape out of prose:
    `keyword` and keyword-specific `params`."
   (:require [com.blockether.skjema.core :as skjema]
-            [com.blockether.skjema.json :as json]
             [lazytest.experimental.interfaces.clojure-test :refer [deftest is testing]]))
 
 (deftest a-nested-error-is-both-standard-and-machine-readable
@@ -92,8 +91,8 @@
 
 (deftest structured-errors-remain-json-values
   (let [answer (-> (skjema/validate {"required" ["name"]} {})
-                   json/write-str
-                   json/read-str)]
+                   skjema/write-schema
+                   skjema/read-schema)]
     (is (= {"valid" false
             "errors" [{"instanceLocation" ""
                        "keywordLocation" "/required"

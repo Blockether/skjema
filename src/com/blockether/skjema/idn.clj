@@ -27,45 +27,9 @@
    out. Both agree with the published data on everything a domain name can
    hold; neither is a substitute for the tables themselves."
   (:require [clojure.string :as str])
-  (:import (java.text Normalizer Normalizer$Form)
+  (:import (com.blockether.skjema Fast)
+           (java.text Normalizer Normalizer$Form)
            (java.util Locale)))
-
-;; Punycode (RFC 3492)
-
-(def ^:private ^:const p-base 36)
-(def ^:private ^:const p-tmin 1)
-(def ^:private ^:const p-tmax 26)
-(def ^:private ^:const p-skew 38)
-(def ^:private ^:const p-damp 700)
-(def ^:private ^:const p-initial-bias 72)
-(def ^:private ^:const p-initial-n 128)
-
-(defn- adapt ^long [^long delta ^long numpoints first?]
-  (let [damp (long p-damp) base (long p-base) tmin (long p-tmin)
-        tmax (long p-tmax) skew (long p-skew)
-        delta (long (if first? (quot delta damp) (quot delta 2)))
-        delta (+ delta (quot delta numpoints))]
-    (loop [delta delta k 0]
-      (if (> delta (quot (* (- base tmin) tmax) 2))
-        (recur (quot delta (- base tmin)) (+ k base))
-        (+ k (quot (* (inc (- base tmin)) delta) (+ delta skew)))))))
-
-(defn- threshold ^long [^long k ^long bias]
-  (let [tmin (long p-tmin) tmax (long p-tmax) t (- k bias)]
-    (cond (< t tmin) tmin
-          (> t tmax) tmax
-          :else t)))
-
-(defn- basic-digit
-  "The value of one Punycode digit, or nil when the character is not one."
-  [^long c]
-  (cond (<= 48 c 57) (+ 26 (- c 48))
-        (<= 97 c 122) (- c 97)
-        (<= 65 c 90) (- c 65)
-        :else nil))
-
-(defn- digit-char ^long [^long d]
-  (if (< d 26) (+ 97 d) (+ 48 (- d 26))))
 
 (defn code-points
   "The code points of `s` as a vector, so a character outside the basic plane
@@ -73,78 +37,18 @@
   [^String s]
   (vec (.toArray (.codePoints s))))
 
-(defn- from-code-points ^String [cps]
-  (let [sb (StringBuilder.)]
-    (doseq [cp cps] (.appendCodePoint sb (int cp)))
-    (.toString sb)))
+(defn- from-code-points ^String [points]
+  (Fast/fromCodePoints points))
 
 (defn decode
   "The string a Punycode body encodes, or nil when it is not Punycode."
   [^String s]
-  (when-not (some #(>= (long %) 128) (code-points s))
-    (let [delim (.lastIndexOf s "-")
-          basic (if (pos? delim) (subs s 0 delim) "")
-          ext (if (pos? delim) (subs s (inc delim)) (if (zero? delim) (subs s 1) s))
-          ext-cps (code-points ext)
-          n-ext (count ext-cps)]
-      (loop [out (code-points basic), i 0, n (long p-initial-n), bias (long p-initial-bias), at 0]
-        (if (>= at n-ext)
-          (from-code-points out)
-          (let [[i' at' ok?]
-                (loop [i (long i), at (long at), k (long p-base), w 1]
-                  (if (>= at n-ext)
-                    [i at false]
-                    (let [d (basic-digit (long (nth ext-cps at)))
-                          t (threshold k bias)]
-                      (cond
-                        (nil? d) [i at false]
-                        (> (* (long d) (long w)) 0x7fffffff) [i at false]
-                        :else
-                        (let [i (+ i (* (long d) (long w)))]
-                          (if (< (long d) t)
-                            [i (inc at) true]
-                            (recur i (inc at) (+ k (long p-base)) (* w (- (long p-base) t)))))))))]
-            (when ok?
-              (let [len (inc (count out))
-                    bias' (adapt (- i' i) len (zero? i))
-                    n' (+ n (quot i' len))
-                    pos (rem i' len)]
-                (when (>= n' 128)
-                  (when (Character/isValidCodePoint (int n'))
-                    (recur (vec (concat (subvec out 0 pos) [n'] (subvec out pos)))
-                           (inc pos) n' bias' (long at'))))))))))))
+  (Fast/punycodeDecode s))
 
 (defn encode
   "`s` as the body of an A-label - Punycode, without the `xn--` prefix."
   ^String [^String s]
-  (let [cps (code-points s)
-        basic (filterv #(< (long %) 128) cps)
-        b (count basic)
-        sb (StringBuilder. (from-code-points basic))]
-    (when (pos? b) (.append sb \-))
-    (loop [n (long p-initial-n), delta 0, bias (long p-initial-bias), h (long b)]
-      (if (>= h (count cps))
-        (.toString sb)
-        (let [m (long (reduce min (filter #(>= (long %) n) cps)))
-              delta (+ delta (* (- m n) (inc h)))
-              [delta bias h]
-              (reduce (fn [[delta bias h] cp]
-                        (let [cp (long cp)]
-                          (cond
-                            (< cp m) [(inc delta) bias h]
-                            (> cp m) [delta bias h]
-                            :else
-                            (do (loop [q delta k p-base]
-                                  (let [t (threshold k bias)]
-                                    (if (< q t)
-                                      (.appendCodePoint sb (int (digit-char q)))
-                                      (do (.appendCodePoint
-                                           sb (int (digit-char (+ t (rem (- q t) (- p-base t))))))
-                                          (recur (quot (- q t) (- p-base t)) (+ k p-base))))))
-                                [0 (adapt delta (inc h) (= h b)) (inc h)]))))
-                      [delta bias h]
-                      cps)]
-          (recur (inc m) (long (inc delta)) (long bias) (long h)))))))
+  (Fast/punycodeEncode s))
 
 ;; The derived property of RFC 5892
 
@@ -410,40 +314,10 @@
     (+ 4 (count (encode (from-code-points cps))))
     (count label)))
 
-(defn- ldh-span?
-  "Whether `[start end)` of `s` is a letter-digit-hyphen label: 1 to 63 ASCII
-   lower-case letters, digits and hyphens, which may neither open nor close it.
-   An `xn--` label answers false, because a name carrying one has Punycode to
-   decode and is not this simple."
-  [^String s ^long start ^long end]
-  (let [len (- end start)]
-    (and (<= 1 len 63)
-         (not (.startsWith s "xn--" (int start)))
-         (loop [i start]
-           (if (= i end)
-             true
-             (let [c (int (.charAt s (int i)))]
-               (if (or (and (>= c 97) (<= c 122))
-                       (and (>= c 48) (<= c 57))
-                       (and (= c 45) (not= i start) (not= i (dec end))))
-                 (recur (inc i))
-                 false)))))))
-
 (defn- plain-ascii-name?
-  "The names none of the machinery above has anything to say about: pure ASCII
-   and no `xn--` label, so there is nothing to decode, no derived property to
-   look up and no Bidi rule to apply - RFC 1123's shape decides it, in one pass
-   and without a single allocation. Answering false is not a verdict: the name
-   is then read the long way."
+  "The allocation-free RFC 1123 path. False falls through to complete IDNA."
   [^String s]
-  (let [n (.length s)]
-    (and (<= 1 n 253)
-         (ascii? s)
-         (loop [i 0 start 0]
-           (cond
-             (= i n) (ldh-span? s start n)
-             (= (.charAt s i) \.) (if (ldh-span? s start i) (recur (inc i) (inc i)) false)
-             :else (recur (inc i) start))))))
+  (Fast/plainAsciiHostname s))
 
 (defn hostname?
   "Whether `s` is an internationalized host name."

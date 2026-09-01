@@ -1,38 +1,27 @@
-;; skjema — JSON Schema 2020-12 validation for Clojure. See README.md.
-;;
-;; No runtime dependencies, on purpose. A validator that drags a JSON parser in
-;; forces that parser AND its version on every consumer; `skjema.json` is this
-;; library's own RFC 8259 reader/writer, so `skjema.core` compiles and validates
-;; data that is ALREADY parsed — by us, by charred, by whatever the host uses.
-;; Nothing here reaches past clojure.core, so native-image needs no
-;; configuration and no Jackson lands on anybody's classpath.
-{:paths ["src" "resources"]
+;; skjema — fast JSON Schema 2020-12 validation for Clojure.
+;; Charred owns JSON; Java owns allocation-sensitive validation and IDN loops.
+{:paths ["src" "resources" "target/classes"]
+ :deps/prep-lib {:alias :build
+                 :fn compile-java
+                 :ensure "target/classes/com/blockether/skjema/Fast.class"}
 
- :deps {}
+ :deps {com.cnuernber/charred {:mvn/version "1.041"}}
 
  :aliases
  {:build
-  {:deps {io.github.clojure/tools.build {:mvn/version "0.10.9"}
+  {:extra-paths ["."]
+   :deps {io.github.clojure/tools.build {:mvn/version "0.10.9"}
           slipset/deps-deploy           {:mvn/version "0.2.5"}}
    :ns-default build}
 
-  ;; The gate is the official json-schema-org/JSON-Schema-Test-Suite
-  ;; (tests/draft2020-12, `optional/` included) plus nst/JSONTestSuite for the
-  ;; reader, both vendored under test/resources — a test never downloads. Test
-  ;; scope adds only a runner: the suite files are JSON, so reading them is the
-  ;; reader's own first conformance test. Lazytest is that runner; a namespace
-  ;; that requires `clojure.test` is silently never discovered, so the tests
-  ;; speak `lazytest.experimental.interfaces.clojure-test` and nothing else.
+  ;; Official JSON Schema conformance plus focused API and error tests.
   :test
   {:extra-paths ["test"]
    :extra-deps  {org.clojure/clojure            {:mvn/version "1.12.4"}
                  io.github.noahtheduke/lazytest {:mvn/version "2.0.0"}}
    :main-opts   ["-m" "lazytest.main" "test"]}
 
-  ;; The speed claim, kept honest: `bench/` measures this validator against
-  ;; malli on the very same Clojure data, both sides prepared once. It is not
-  ;; on the test classpath — a benchmark dependency is not a library
-  ;; dependency, and nothing in `src` may ever require it.
+  ;; Compiled validation benchmarked over identical parsed values.
   :bench
   {:extra-paths ["bench"]
    :extra-deps  {org.clojure/clojure {:mvn/version "1.12.4"}

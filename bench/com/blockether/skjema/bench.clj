@@ -2,7 +2,7 @@
   "How fast the validator is, measured against malli on the same data.
 
    The comparison is deliberately unfair to nobody: both sides get their
-   schema PREPARED once (`skjema/compile`, `m/validator`) and are then handed
+   schema PREPARED once (`skjema/compile-schema`, `m/validator`) and are then handed
    the very same Clojure data, so what is measured is validation, not parsing
    and not schema construction. Construction is timed separately, because a
    caller pays it once.
@@ -85,32 +85,32 @@
 (def ^:private cases
   [{:id "user-valid"
     :what "object of 9 members, nested object, array of 2 - VALID"
-    :skjema (let [c (skjema/compile user-json-schema)] #(skjema/valid? c user))
+    :skjema (let [c (skjema/compile-schema user-json-schema)] #(skjema/valid? c user))
     :malli (let [v (m/validator user-malli-schema)] #(v user))
     :expect true}
    {:id "user-invalid"
     :what "the same object, two members wrong - INVALID"
-    :skjema (let [c (skjema/compile user-json-schema)] #(skjema/valid? c bad-user))
+    :skjema (let [c (skjema/compile-schema user-json-schema)] #(skjema/valid? c bad-user))
     :malli (let [v (m/validator user-malli-schema)] #(v bad-user))
     :expect false}
    {:id "user-errors"
     :what "the same object, ERRORS reported (skjema BASIC output vs malli explain)"
-    :skjema (let [c (skjema/compile user-json-schema)] #(skjema/validate c bad-user))
+    :skjema (let [c (skjema/compile-schema user-json-schema)] #(skjema/validate c bad-user))
     :malli (let [s (m/schema user-malli-schema)] #(m/explain s bad-user))
     :expect nil}
    {:id "scalar"
     :what "one string, minLength/maxLength - per-call overhead"
-    :skjema (let [c (skjema/compile scalar-json-schema)] #(skjema/valid? c "hello"))
+    :skjema (let [c (skjema/compile-schema scalar-json-schema)] #(skjema/valid? c "hello"))
     :malli (let [v (m/validator scalar-malli-schema)] #(v "hello"))
     :expect true}
    {:id "numbers-1000"
     :what "array of 1000 integers with bounds - throughput"
-    :skjema (let [c (skjema/compile numbers-json-schema)] #(skjema/valid? c numbers))
+    :skjema (let [c (skjema/compile-schema numbers-json-schema)] #(skjema/valid? c numbers))
     :malli (let [v (m/validator numbers-malli-schema)] #(v numbers))
     :expect true}
    {:id "prepare"
     :what "preparing the schema itself (compile / validator), paid once"
-    :skjema #(skjema/compile user-json-schema)
+    :skjema #(skjema/compile-schema user-json-schema)
     :malli #(m/validator user-malli-schema)
     :expect nil}])
 

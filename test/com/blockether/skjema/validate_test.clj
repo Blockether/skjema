@@ -3,8 +3,7 @@
    that change what asserts, and the keywords a schema older than 2020-12
    still means."
   (:require [lazytest.experimental.interfaces.clojure-test :refer [deftest is testing]]
-            [com.blockether.skjema.core :as skjema]
-            [com.blockether.skjema.json :as json]))
+            [com.blockether.skjema.core :as skjema]))
 
 (def ^:private user-schema
   {"$id" "https://example.com/user.json"
@@ -44,7 +43,7 @@
                      "params" {"missingProperty" "name"}
                      "absoluteKeywordLocation" "https://example.com/user.json#/required"
                      "error" "missing required property \"name\""}]}
-         (json/read-str (json/write-str (skjema/validate user-schema {}))))))
+         (skjema/read-schema (skjema/write-schema (skjema/validate user-schema {}))))))
 
 (deftest a-schema-without-an-identifier-has-no-absolute-location
   (let [[error] (:errors (skjema/validate {"type" "integer"} "no"))]
@@ -73,7 +72,7 @@
         schema {"$id" "https://example.com/asserting"
                 "$schema" "https://example.com/format-meta"
                 "format" "ipv4"}
-        compiled (skjema/compile schema {:registry {"https://example.com/format-meta" meta-schema}})]
+        compiled (skjema/compile-schema schema {:registry {"https://example.com/format-meta" meta-schema}})]
     (testing "declaring the vocabulary is the request; the boolean beside it only speaks to implementations without it"
       (is (false? (skjema/valid? compiled "not-an-address")))
       (is (true? (skjema/valid? compiled "127.0.0.1"))))))
@@ -108,3 +107,30 @@
     (is (true? (skjema/valid? schema ["a" 1 true])))
     (is (false? (skjema/valid? schema [1])))
     (is (false? (skjema/valid? schema ["a" 1 "and one too many"])))))
+
+(deftest malformed-schemas-fail-at-compilation-with-actionable-data
+  (doseq [[schema location] [[{"type" "mystery"} "/type"]
+                             [{"required" "name"} "/required"]
+                             [{"multipleOf" 0} "/multipleOf"]
+                             [{"minLength" -1} "/minLength"]]]
+    (let [error (try (skjema/compile-schema schema) nil
+                     (catch clojure.lang.ExceptionInfo e e))]
+      (is (= :schema/invalid (:skjema/error (ex-data error))))
+      (is (= location (:instanceLocation (first (:errors (ex-data error))))))
+      (is (re-find (re-pattern (java.util.regex.Pattern/quote location)) (ex-message error)))))
+  (let [error (try (skjema/compile-schema {"patternProperties" {"[" true}}) nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+    (is (= :schema/invalid (:skjema/error (ex-data error))))
+    (is (= "/patternProperties/[" (:keywordLocation (ex-data error))))
+    (is (instance? java.util.regex.PatternSyntaxException (ex-cause error)))))
+
+(deftest compiled-numeric-path-is-total-and-matches-complete-evaluation
+  (doseq [[schema instances]
+          [[{"type" "integer"} [(float 1) (short 1) (byte 1) (float 1.5)]]
+           [{"minimum" 0} [1/2 -1/2 ##NaN ##Inf]]
+           [{"enum" [1/2]} [1/2 0.5 1]]]]
+    (let [compiled (skjema/compile-schema schema)
+          complete (assoc compiled :fast-validator nil)]
+      (doseq [instance instances]
+        (is (= (skjema/valid? complete instance)
+               (skjema/valid? compiled instance)))))))

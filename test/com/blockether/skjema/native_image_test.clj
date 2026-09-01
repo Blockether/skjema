@@ -5,7 +5,7 @@
    this suite green. The registration travels inside the jar, so a consumer
    builds a working image without knowing this library reads anything."
   (:require [clojure.java.io :as io]
-            [com.blockether.skjema.json :as json]
+            [com.blockether.skjema.core :as skjema]
             [lazytest.experimental.interfaces.clojure-test :refer [deftest is testing]])
   (:import (java.nio.file FileSystems Paths)))
 
@@ -15,7 +15,7 @@
 (def ^:private meta-schema-dir "resources/com/blockether/skjema/meta/2020-12")
 
 (defn- globs []
-  (->> (json/read-str (slurp (io/file metadata-path)))
+  (->> (skjema/read-schema (io/file metadata-path))
        (#(get % "resources"))
        (map #(get % "glob"))))
 

@@ -17,8 +17,7 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [lazytest.experimental.interfaces.clojure-test :refer [deftest is testing]]
-            [com.blockether.skjema.core :as skjema]
-            [com.blockether.skjema.json :as json])
+            [com.blockether.skjema.core :as skjema])
   (:import (java.io File)))
 
 (def ^:private suite-root "test/resources/JSON-Schema-Test-Suite")
@@ -31,7 +30,7 @@
             (for [^File f (file-seq root)
                   :when (and (.isFile f) (str/ends-with? (.getName f) ".json"))]
               [(str "http://localhost:1234/" (subs (.getPath f) prefix))
-               (json/read-str (slurp f))])))))
+               (skjema/read-schema f)])))))
 
 (defn- json-files [^File dir recursive?]
   (->> (if recursive? (file-seq dir) (.listFiles dir))
@@ -41,9 +40,9 @@
 (defn- run-file
   "Every disagreement between the suite and the validator, as data."
   [^File f opts]
-  (for [group (json/read-str (slurp f))
+  (for [group (skjema/read-schema f)
         :let [compiled (try
-                         (skjema/compile (get group "schema") (merge {:registry @remotes} opts))
+                         (skjema/compile-schema (get group "schema") (merge {:registry @remotes} opts))
                          (catch Throwable t t))]
         test-case (get group "tests")
         :let [expected (get test-case "valid")
@@ -60,7 +59,7 @@
      :actual actual}))
 
 (defn- assertion-count [files]
-  (reduce + (for [^File f files, group (json/read-str (slurp f))]
+  (reduce + (for [^File f files, group (skjema/read-schema f)]
               (count (get group "tests")))))
 
 (deftest json-schema-test-suite
@@ -82,3 +81,28 @@
         (doseq [x (take 3 fs)]
           (println "   -" (:group x) "|" (:test x) "| expected" (:expected x) "got" (:actual x)))))
     (is (empty? failures) (str (count failures) " assertions of the suite disagree"))))
+
+(deftest compiled-predicates-match-the-complete-evaluator
+  (let [files (json-files (io/file suite-root "tests/draft2020-12") false)
+        checked (atom 0)
+        disagreements
+        (vec
+         (for [^File file files
+               group (skjema/read-schema file)
+               :let [compiled (skjema/compile-schema (get group "schema"))]
+               :when (:fast-validator compiled)
+               test-case (get group "tests")
+               :let [instance (get test-case "data")
+                     expected (get test-case "valid")
+                     fast (skjema/valid? compiled instance)
+                     complete (skjema/valid? (assoc compiled :fast-validator nil) instance)
+                     _ (swap! checked inc)]
+               :when (not= expected fast complete)]
+           {:file (.getName file)
+            :group (get group "description")
+            :test (get test-case "description")
+            :expected expected
+            :fast fast
+            :complete complete}))]
+    (is (< 100 @checked) "the official suite did not exercise the compiled predicate")
+    (is (empty? disagreements) (pr-str (take 5 disagreements)))))

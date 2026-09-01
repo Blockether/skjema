@@ -46,6 +46,9 @@ jobs:
           restore-keys: |
             deps-${{ runner.os }}-
 
+      - name: Compile Java
+        run: clojure -X:build compile-java
+
       - name: Test
         run: clojure -M:test
 

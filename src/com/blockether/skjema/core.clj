@@ -24,19 +24,53 @@
    index that comes out is what `$ref` and `$dynamicRef` read. Nothing is
    fetched over the network, ever - a schema that references a document the
    caller did not supply is a compile error, not a silent pass."
-  (:refer-clojure :exclude [compile])
-  (:require [clojure.java.io :as io]
+  (:require [charred.api :as charred]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [com.blockether.skjema.format :as fmt]
-            [com.blockether.skjema.json :as json]
             [com.blockether.skjema.regex :as regex]
             [com.blockether.skjema.uri :as uri])
-  (:import (java.math BigDecimal)))
+  (:import (com.blockether.skjema Fast)
+           (java.math BigDecimal)
+           (java.nio.file Path)
+           (java.util.function Predicate)))
+
+(defn- source-label [source]
+  (cond
+    (string? source) "JSON string"
+    (instance? Path source) (str source)
+    (instance? java.net.URL source) (.toExternalForm ^java.net.URL source)
+    :else (str source)))
+
+(defn read-schema
+  "Read a JSON Schema from JSON text, a Path, File, URL/resource, InputStream,
+   or Reader. Objects keep their JSON string keys."
+  [source]
+  (when (nil? source)
+    (throw (ex-info "cannot read a schema from nil" {:skjema/error :schema/read})))
+  (let [input (if (instance? Path source) (.toFile ^Path source) source)
+        label (source-label source)]
+    (try
+      (charred/read-json input)
+      (catch Throwable t
+        (throw (ex-info (str "could not read schema from " label ": " (ex-message t))
+                        {:skjema/error :schema/read :source label}
+                        t))))))
+
+(defn write-schema
+  "Render a schema or validation result as compact JSON."
+  ^String [value]
+  (try
+    (charred/write-json-str value :escape-unicode false :escape-slash false)
+    (catch Throwable t
+      (throw (ex-info (str "could not write schema: " (ex-message t))
+                      {:skjema/error :schema/write}
+                      t)))))
 
 (def ^:private ^:const max-eval-depth
-  "A cyclic schema (`{\"$ref\": \"#\"}`) recurses without the instance ever
-   shrinking. Data-driven recursion terminates on its own; this bound only
-   turns the pathological schema into an error a caller can catch."
+  "A cyclic self-reference can recurse without the instance ever shrinking.
+   Data-driven recursion terminates on its own; this bound turns a pathological
+   schema into an error a caller can catch."
   2048)
 
 (defrecord Ctx
@@ -60,21 +94,30 @@
     (into {}
           (for [f ["schema" "meta-core" "meta-applicator" "meta-unevaluated"
                    "meta-validation" "meta-meta-data" "meta-format-annotation" "meta-content"]
-                :let [doc (json/read-str
-                           (slurp (io/resource (str "com/blockether/skjema/meta/2020-12/" f ".json"))))]]
+                :let [doc (read-schema
+                           (io/resource (str "com/blockether/skjema/meta/2020-12/" f ".json")))]]
             [(get doc "$id") doc]))))
 
 ;; JSON values
 
+(defn- json-number? [x]
+  (and (number? x)
+       (cond
+         (instance? Double x) (Double/isFinite (double x))
+         (instance? Float x) (Float/isFinite (float x))
+         :else true)))
+
 (defn- integral?
-  "True when the number is an integer VALUE. JSON has one number type, so `1.0`
-   is an integer and the specification says so explicitly."
+  "True when a JSON number has an integer value."
   [x]
   (cond
-    (instance? Double x) (let [d (double x)] (and (Double/isFinite d) (== d (Math/rint d))))
-    (or (instance? Long x) (instance? Integer x) (instance? java.math.BigInteger x)
+    (or (instance? Double x) (instance? Float x))
+    (let [d (double x)] (and (Double/isFinite d) (== d (Math/rint d))))
+    (or (instance? Byte x) (instance? Short x) (instance? Integer x)
+        (instance? Long x) (instance? java.math.BigInteger x)
         (instance? clojure.lang.BigInt x)) true
-    (instance? BigDecimal x) (zero? (.compareTo ^BigDecimal x (.setScale ^BigDecimal x 0 java.math.RoundingMode/DOWN)))
+    (instance? BigDecimal x)
+    (zero? (.compareTo ^BigDecimal x (.setScale ^BigDecimal x 0 java.math.RoundingMode/DOWN)))
     :else false))
 
 (defn- json-type
@@ -86,13 +129,13 @@
     (string? x) "string"
     (map? x) "object"
     (sequential? x) "array"
-    (number? x) (if (integral? x) "integer" "number")
+    (json-number? x) (if (integral? x) "integer" "number")
     :else "unknown"))
 
 (defn- type-match? [t x]
   (case t
-    "integer" (and (number? x) (integral? x))
-    "number" (number? x)
+    "integer" (and (json-number? x) (integral? x))
+    "number" (json-number? x)
     (= t (json-type x))))
 
 (defn- canonical
@@ -101,7 +144,7 @@
   [x]
   (cond
     (instance? Boolean x) x
-    (number? x) [::number (.stripTrailingZeros (bigdec x))]
+    (json-number? x) [::number (.stripTrailingZeros (bigdec x))]
     (map? x) (persistent! (reduce-kv (fn [m k v] (assoc! m k (canonical v))) (transient {}) x))
     (sequential? x) (mapv canonical x)
     :else x))
@@ -129,11 +172,11 @@
   [a b]
   (cond
     (and (string? a) (string? b)) (.equals ^String a ^String b)
-    (and (number? a) (number? b)) (zero? (num-compare a b))
+    (and (json-number? a) (json-number? b)) (zero? (num-compare a b))
     (or (nil? a) (nil? b)) (and (nil? a) (nil? b))
     (or (instance? Boolean a) (instance? Boolean b))
     (and (instance? Boolean a) (instance? Boolean b) (= a b))
-    (or (string? a) (string? b) (number? a) (number? b)) false
+    (or (string? a) (string? b) (json-number? a) (json-number? b)) false
     :else (= (canonical a) (canonical b))))
 
 (defn- multiple-of? [x divisor]
@@ -282,14 +325,25 @@
 
     (sequential? x) (mapv with-masks x)
     :else x))
+(defn- compile-pattern! [location pattern]
+  (when (string? pattern)
+    (try
+      (regex/pattern-of pattern)
+      (catch java.util.regex.PatternSyntaxException t
+        (throw (ex-info (str "invalid regular expression at " location ": "
+                             (.getDescription t))
+                        {:skjema/error :schema/invalid
+                         :keywordLocation location
+                         :pattern pattern}
+                        t))))))
+
 (defn- index-schema
-  "Record every identifier `schema` declares, descending ONLY through keywords
-   that hold schemas. Walking every object instead would read a `$id` inside a
-   `const` or an `enum` as if it were an identifier, which it is not."
+  "Index identifiers and precompile regular expressions in schema-valued nodes."
   [acc schema base ptr]
   (if-not (map? schema)
     acc
-    (let [id (get schema "$id")
+    (let [_ (compile-pattern! (str ptr "/pattern") (get schema "pattern"))
+          id (get schema "$id")
           resource? (string? id)
           base (if resource? (uri/strip-fragment (uri/resolve-ref base id)) base)
           ptr (if resource? "" ptr)
@@ -320,6 +374,8 @@
 
              (and (subschema-map-keywords k) (map? v))
              (reduce-kv (fn [acc kk sub]
+                          (when (= k "patternProperties")
+                            (compile-pattern! (str kptr "/" (uri/escape-token kk)) kk))
                           (index-schema acc sub base (str kptr "/" (uri/escape-token kk))))
                         acc
                         v)
@@ -944,10 +1000,10 @@
                   (merge-res res (err (at-keyword ctx "const")
                                       {:allowedValue const}
                                       (str "the instance is not the constant "
-                                           (json/write-str const))))))
+                                           (write-schema const))))))
               res)]
     (cond
-      (number? instance) (if (has? km m-numbers) (assert-numbers km ctx schema instance res) res)
+      (json-number? instance) (if (has? km m-numbers) (assert-numbers km ctx schema instance res) res)
       (string? instance) (if (has? km m-strings) (assert-strings km ctx schema instance res) res)
       (map? instance) (if (has? km m-objects) (assert-objects km ctx schema instance res) res)
       (sequential? instance) (if (has? km m-arrays) (assert-arrays km ctx schema instance res) res)
@@ -1154,23 +1210,14 @@
          0
          nil))
 
-(defn compile
-  "Index a schema once so every `$ref`, `$anchor` and `$dynamicAnchor` in it is
-   already resolved when validation runs.
-
-   Options:
-     `:base`     the URI the schema is considered to have been retrieved from
-     `:registry` a map of absolute URI -> schema for documents this one
-                 references. Nothing is fetched; a reference to a document the
-                 registry does not carry fails when it is followed.
-     `:format-assertion` make `format` assert instead of annotate. The
-                 specification leaves that to the caller unless a meta-schema
-                 declares the format-assertion vocabulary, which turns it on
-                 for that resource whatever this option says."
-  ([schema] (compile schema nil))
+(defn compile-schema
+  "Compile and index a schema once so repeated validation does not walk its
+   structure. Options: `:base`, `:registry`, and `:format-assertion`. Referenced
+   documents are resolved only from the supplied registry."
+  ([schema] (compile-schema schema nil))
   ([schema opts]
    (let [base (uri/strip-fragment (or (:base opts) ""))
-         registry (merge @bundled-meta-schemas (:registry opts))
+         registry (update-vals (merge @bundled-meta-schemas (:registry opts)) with-masks)
          acc (reduce-kv (fn [acc uri doc]
                           (-> acc
                               (assoc-in [:index uri] {:schema doc :base uri :ptr ""})
@@ -1198,10 +1245,26 @@
               ;; same handful of answers, once per compiled schema instead of
               ;; once per instance.
             :ref-cache (atom {})
-            :format-assertion (boolean (:format-assertion opts))}]
-     (assoc c :ctx (eval-ctx c false) :quiet-ctx (eval-ctx c true)))))
+            :format-assertion (boolean (:format-assertion opts))}
+         compiled (assoc c :ctx (eval-ctx c false) :quiet-ctx (eval-ctx c true))
+         meta-uri (when (map? schema) (or (get schema "$schema") official-meta-schema))
+         target (when (= official-meta-schema meta-uri)
+                  (get-in compiled [:index meta-uri]))
+         checked (when target
+                   (eval-schema (-> (:ctx compiled) (enter target)) (:schema target) schema))]
+     (when (and checked (not (:valid? checked)))
+       (let [errors (vec (:errors checked))
+             first-error (or (first (remove #(#{"allOf" "anyOf" "oneOf"} (:keyword %)) errors))
+                             (first errors))]
+         (throw (ex-info (str "invalid JSON Schema at "
+                              (or (not-empty (:instanceLocation first-error)) "/")
+                              ": " (:error first-error))
+                         {:skjema/error :schema/invalid :errors errors}))))
+     (assoc compiled :fast-validator
+            (when-not (or (:format-assertion opts) (seq (:registry opts)))
+              (Fast/compileValidator schema regex/pattern-of))))))
 
-(defn compiled? [x] (boolean (:skjema/compiled x)))
+(defn compiled-schema? [x] (boolean (:skjema/compiled x)))
 
 (defn validate
   "Validate `instance` against a compiled schema (or a raw one, compiled on the
@@ -1211,7 +1274,7 @@
    JSON value."
   ([schema instance] (validate schema instance nil))
   ([schema instance opts]
-   (let [c (if (compiled? schema) schema (compile schema opts))
+   (let [c (if (compiled-schema? schema) schema (compile-schema schema opts))
          r (eval-schema (:ctx c) (:schema c) instance)]
      (if (:valid? r)
        {:valid true}
@@ -1223,5 +1286,7 @@
    that refuses and no error is built on the way."
   ([schema instance] (valid? schema instance nil))
   ([schema instance opts]
-   (let [c (if (compiled? schema) schema (compile schema opts))]
-     (true? (:valid? (eval-schema (:quiet-ctx c) (:schema c) instance))))))
+   (let [c (if (compiled-schema? schema) schema (compile-schema schema opts))]
+     (if-let [^Predicate validator (:fast-validator c)]
+       (.test validator instance)
+       (true? (:valid? (eval-schema (:quiet-ctx c) (:schema c) instance)))))))
