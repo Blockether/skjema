@@ -69,8 +69,12 @@
   2048)
 
 (defrecord Ctx
+           ;; `keyword` is a declared FIELD because every descent sets it: a key the
+           ;; record does not declare lands in its extension map, which is another
+           ;; allocation on the hot path and a slower read when an error names it.
            [index dynamic ref-cache base dyn-scope validation? format-assertion? format?
-            annotate? quiet? id-resolved inst-path kw-path res-prefix res-path depth dialect])
+            annotate? quiet? id-resolved inst-path kw-path res-prefix res-path depth dialect
+            keyword])
 
 (def ^:private validation-vocabulary
   "https://json-schema.org/draft/2020-12/vocab/validation")
@@ -319,7 +323,36 @@
       (assoc (meta x) ::mask (compute-mask x)))
 
     (sequential? x) (mapv with-masks x)
+    (sequential? x) (mapv with-masks x)
     :else x))
+
+(defn- with-fast
+  "Attach to every schema node the compiled predicate the fast compiler could
+   build for it, or nothing where it refuses. A node that says VALID this way
+   has nothing wrong underneath it, so `explain` never walks it to find out -
+   and a schema the fast compiler refuses at the root still gets the benefit
+   inside, one subschema at a time."
+  [x]
+  (if-not (map? x)
+    x
+    (let [node (reduce-kv
+                (fn [acc k v]
+                  (cond
+                    (subschema-keywords k)
+                    (assoc acc k (with-fast v))
+
+                    (and (subschema-array-keywords k) (sequential? v))
+                    (assoc acc k (mapv with-fast v))
+
+                    (and (subschema-map-keywords k) (map? v))
+                    (assoc acc k (update-vals v with-fast))
+
+                    :else acc))
+                x
+                x)]
+      (if-let [p (Fast/compileValidator node regex/pattern-of)]
+        (vary-meta node assoc ::fast p)
+        node))))
 (defn- compile-pattern! [location pattern]
   (when (string? pattern)
     (try
@@ -477,17 +510,17 @@
   ([ctx a]
    (if (:quiet? ctx)
      ctx
-     (-> ctx
-         (assoc :keyword a)
-         (update :kw-path conj a)
-         (update :res-path conj a))))
+     (assoc ctx
+            :keyword a
+            :kw-path (conj (:kw-path ctx) a)
+            :res-path (conj (:res-path ctx) a))))
   ([ctx a b]
    (if (:quiet? ctx)
      ctx
-     (-> ctx
-         (assoc :keyword a)
-         (update :kw-path conj a b)
-         (update :res-path conj a b)))))
+     (assoc ctx
+            :keyword a
+            :kw-path (conj (:kw-path ctx) a b)
+            :res-path (conj (:res-path ctx) a b)))))
 
 (defn- at-instance [ctx token]
   (if (:quiet? ctx)
@@ -1096,6 +1129,14 @@
     (true? schema) ok
     (false? schema) (err ctx {} "the false schema rejects every instance")
 
+    ;; A node the fast compiler took answers a VALID instance by itself: nothing
+    ;; under it can be wrong, so the walk that exists to say what IS wrong never
+    ;; runs. A document that asks what was EVALUATED still walks, because the
+    ;; fast answer carries no annotations.
+    (and (not (:annotate? ctx))
+         (map? schema)
+         (when-some [^Predicate p (::fast (meta schema))] (.test p instance)))
+    ok
     (map? schema)
     (let [km (mask schema)
           ;; A resource reached through a reference is ALREADY at its canonical
@@ -1203,6 +1244,7 @@
          false
          [] [] "" []
          0
+         nil
          nil))
 
 (defn compile-schema
@@ -1220,6 +1262,15 @@
                         {:index {} :dynamic {}}
                         registry)
          schema (with-masks schema)
+         ;; The fast compiler reads 2020-12 as written. A document that declares
+         ;; another dialect is evaluated through a legacy view it never sees, and
+         ;; a registry or an asserting `format` is beyond it, so those documents
+         ;; stay with the complete evaluator.
+         fast? (and (not (:format-assertion opts))
+                    (empty? (:registry opts))
+                    (contains? #{nil official-meta-schema}
+                               (when (map? schema) (get schema "$schema"))))
+         schema (if fast? (with-fast schema) schema)
          acc (index-schema acc schema base "")
          root-base (if (and (map? schema) (string? (get schema "$id")))
                      (uri/strip-fragment (uri/resolve-ref base (get schema "$id")))
@@ -1255,9 +1306,7 @@
                               (or (not-empty (:instanceLocation first-error)) "/")
                               ": " (:error first-error))
                          {:skjema/error :schema/invalid :errors errors}))))
-     (assoc compiled :fast-validator
-            (when-not (or (:format-assertion opts) (seq (:registry opts)))
-              (Fast/compileValidator schema regex/pattern-of))))))
+     (assoc compiled :fast-validator (::fast (meta schema))))))
 
 (defn compiled-schema? [x] (boolean (:skjema/compiled x)))
 

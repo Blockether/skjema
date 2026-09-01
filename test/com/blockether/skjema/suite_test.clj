@@ -46,17 +46,23 @@
                          (catch Throwable t t))]
         test-case (get group "tests")
         :let [expected (get test-case "valid")
-              actual (try
-                       (if (instance? Throwable compiled)
-                         (throw ^Throwable compiled)
-                         (skjema/validate compiled (get test-case "data")))
-                       (catch Throwable e (str "threw: " (.getMessage e))))]
-        :when (not= expected actual)]
+              instance (get test-case "data")
+              answer (fn [ask] (try
+                                 (if (instance? Throwable compiled)
+                                   (throw ^Throwable compiled)
+                                   (ask compiled instance))
+                                 (catch Throwable e (str "threw: " (.getMessage e)))))
+              actual (answer skjema/validate)
+              ;; The reasons take their own path through the evaluator, so the
+              ;; suite holds them to the verdict on every assertion it makes.
+              explained (answer (fn [c x] (nil? (skjema/explain c x))))]
+        :when (not= expected actual explained)]
     {:file (.getName f)
      :group (get group "description")
      :test (get test-case "description")
      :expected expected
-     :actual actual}))
+     :actual actual
+     :explained explained}))
 
 (defn- assertion-count [files]
   (reduce + (for [^File f files, group (skjema/read-schema f)]
@@ -79,7 +85,8 @@
       (doseq [[file fs] (sort-by key (group-by :file failures))]
         (println (format "%-32s %d" file (count fs)))
         (doseq [x (take 3 fs)]
-          (println "   -" (:group x) "|" (:test x) "| expected" (:expected x) "got" (:actual x)))))
+          (println "   -" (:group x) "|" (:test x) "| expected" (:expected x)
+                   "| validate" (:actual x) "| explain" (:explained x)))))
     (is (empty? failures) (str (count failures) " assertions of the suite disagree"))))
 
 (deftest compiled-predicates-match-the-complete-evaluator
