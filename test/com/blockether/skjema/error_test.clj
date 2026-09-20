@@ -102,16 +102,35 @@
                        "error" "missing required property \"name\""}]}
            answer))))
 
-(deftest a-report-carries-at-most-five-errors
+(deftest a-report-carries-at-most-ten-errors
   (let [schema {"type" "object"
-                "properties" (into {} (for [i (range 8)] [(str "p" i) {"type" "string"}]))}
-        instance (into {} (for [i (range 8)] [(str "p" i) i]))
+                "properties" (into {} (for [i (range 14)] [(str "p" i) {"type" "string"}]))}
+        instance (into {} (for [i (range 14)] [(str "p" i) i]))
         compiled (skjema/compile-schema schema)
         fast (skjema/explain compiled instance)
         complete (skjema/explain (assoc compiled :fast-explainer nil :fast-validator nil)
                                  instance)]
-    (testing "eight members are wrong and the report answers the first five of them"
+    (testing "fourteen members are wrong and the report answers the first ten of them"
       (is (false? (:valid fast)))
-      (is (= 5 (count (:errors fast)))))
+      (is (= 10 (count (:errors fast)))))
     (testing "the compiled explainer stops where the complete evaluator was cut"
       (is (= fast complete)))))
+
+(deftest a-refusing-one-of-does-not-crowd-out-the-keyword-that-names-the-typo
+  ;; A discriminated union answers with its branch reasons first - two `const`s, a
+  ;; `not` and a `required` - and the `enum` that says which values the field
+  ;; actually takes arrives last. A report cut at five loses exactly that one, so
+  ;; a caller collapsing the branch noise has nothing left to show.
+  (let [schema {"type" "object"
+                "properties" {"transport" {"enum" ["stdio" "streamable_http"]}
+                              "command" {"type" "string"}
+                              "url" {"type" "string"}}
+                "oneOf" [{"properties" {"transport" {"const" "stdio"}}
+                          "not" {"anyOf" [{"required" ["url"]}]}
+                          "required" ["transport" "command"]}
+                         {"properties" {"transport" {"const" "streamable_http"}}
+                          "not" {"anyOf" [{"required" ["command"]}]}
+                          "required" ["transport" "url"]}]}
+        errors (:errors (skjema/explain schema {"transport" "stdioo" "command" "x"}))]
+    (testing "the enum survives the branch reasons that precede it"
+      (is (some #(and (= "enum" (:keyword %)) (= "/transport" (:instanceLocation %))) errors)))))

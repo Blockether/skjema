@@ -1274,8 +1274,11 @@
 (def ^:private ^:const error-limit
   "How many errors one report carries. A reader acts on the first few and the rest
    only cost the instance that has them, so the walk stops once it has this many
-   and every path answers the same prefix of the same reasons."
-  5)
+   and every path answers the same prefix of the same reasons. Ten, not five: one
+   refusing `oneOf` spends a branch's `const`, `not` and `required` reasons before
+   the plain keyword that names what the value actually got wrong, and a reader
+   who loses that one is left with the noise instead of the answer."
+  10)
 
 (defn- report
   "The BASIC answer for an instance that refused, at no more than `error-limit`
@@ -1987,7 +1990,7 @@
 
 (defn explainer
   "The reasons as a bare function of the instance: nil when it validates, else
-   JSON Schema BASIC output, at most five errors of it. The counterpart of
+   JSON Schema BASIC output, at most ten errors of it. The counterpart of
    `validator` for the same schema."
   ([schema] (explainer schema nil))
   ([schema opts]
@@ -2023,7 +2026,7 @@
    `{:valid false :errors [...]}` - where every error keeps its instance and
    keyword locations and adds `:keyword` plus keyword-specific `:params`, so a
    caller can render or act on it without parsing the human `:error` string. The
-   entire answer is a JSON value, and it carries the first five errors of the
+   entire answer is a JSON value, and it carries the first ten errors of the
    instance: a reader acts on those, and the rest only cost the walk that finds
    them."
   ([schema instance] (explain schema instance nil))
