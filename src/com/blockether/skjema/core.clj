@@ -2009,11 +2009,16 @@
               (let [r (eval-schema ctx schema instance true)]
                 (when-not (:valid? r)
                   (report (:errors r))))))))
-       (fn [instance]
-         (bounded
-          (let [r (eval-schema ctx schema instance)]
-            (when-not (:valid? r)
-              (report (:errors r))))))))))
+       ;; Without a compiled predicate the quiet walk still answers a passing
+       ;; instance, at a tenth of the cost: it stops at the first refusal and
+       ;; builds no error. Only an instance that refuses pays for the reasons.
+       (let [quiet-ctx (:quiet-ctx c)]
+         (fn [instance]
+           (bounded
+            (when-not (true? (:valid? (eval-schema quiet-ctx schema instance)))
+              (let [r (eval-schema ctx schema instance)]
+                (when-not (:valid? r)
+                  (report (:errors r))))))))))))
 
 (defn validate
   "True when `instance` satisfies the schema. `validator` is the same answer

@@ -31,6 +31,25 @@
                                      {:format-assertion true})
                    "not-an-address"))))))
 
+;; Regression: Vis restored a long session in 600 ms, mostly explaining valid
+;; activities. A schema with a registry has no compiled predicate, and explain
+;; ran the walk that builds errors for an instance that had none.
+(deftest a-valid-instance-without-a-compiled-predicate-builds-no-errors
+  (let [compiled (skjema/compile-schema user-schema
+                                        {:registry {"https://example.com/other.json" {"type" "string"}}})
+        walks (atom [])
+        eval-schema @#'skjema/eval-schema]
+    (is (nil? (:fast-validator compiled)))
+    (with-redefs-fn {#'skjema/eval-schema (fn [ctx & more]
+                                            (swap! walks conj (:quiet? ctx))
+                                            (apply eval-schema ctx more))}
+      #(do (is (nil? (skjema/explain compiled {"name" "ada" "tags" ["one"]})))
+           (is (every? true? @walks))
+           (reset! walks [])
+           (testing "an instance that refuses still gets its reasons"
+             (is (= ["/name"] (mapv :instanceLocation (:errors (skjema/explain compiled {"name" "ab"})))))
+             (is (some false? @walks)))))))
+
 (deftest every-error-says-where-it-happened
   (let [{:keys [valid errors]} (skjema/explain user-schema {"name" "ab" "tags" ["ok" 7]})]
     (is (false? valid))
