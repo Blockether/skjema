@@ -1969,6 +1969,21 @@
 
 (defn compiled-schema? [x] (boolean (:skjema/compiled x)))
 
+(defn compile-ref
+  "A compiled schema that validates against `ref`, resolved from the root of
+   `compiled`. It shares the index, options and reference cache of `compiled`,
+   so the definitions of one document cost one compile. It validates with the
+   complete evaluator."
+  [compiled ref]
+  (let [root (:schema compiled)
+        dialect (when (map? root) (get root "$schema"))
+        c (-> (dissoc compiled :fast-validator :fast-explainer)
+              (assoc :schema (with-masks (cond-> {"$ref" ref}
+                                           (string? dialect) (assoc "$schema" dialect)))))]
+    (assoc c
+           :ctx (eval-ctx c false)
+           :quiet-ctx (eval-ctx c true))))
+
 (defn- compiled
   "The schema as compiled, compiling it first when a caller passed a raw one."
   [schema opts]

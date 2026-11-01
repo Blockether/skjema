@@ -41,7 +41,7 @@ that is the fast path, and it is what the benchmark measures:
 
 ## API
 
-Seven calls in `com.blockether.skjema.core`, and that is the whole surface.
+Eight calls in `com.blockether.skjema.core`, and that is the whole surface.
 Instances and schemas are plain data with JSON string keys.
 
 | call | answers |
@@ -49,6 +49,7 @@ Instances and schemas are plain data with JSON string keys.
 | `(read-schema source)` | the parsed JSON. `source` is JSON text, a `Path`, a `File`, a URL or classpath resource, an `InputStream` or a `Reader`. |
 | `(compile-schema schema)`<br>`(compile-schema schema opts)` | the schema indexed and prepared once: references resolved, the document meta-validated, a compiled predicate attached where one can be built. |
 | `(compiled-schema? x)` | true when `x` came out of `compile-schema`. |
+| `(compile-ref compiled ref)` | a compiled schema for `ref`, such as `"#/$defs/tag"`, resolved from the root of `compiled`. It reuses that compile, so many definitions of one document cost one compile. |
 | `(validator schema)`<br>`(validator schema opts)` | `(fn [instance] -> true/false)`, closed over the compiled predicate. |
 | `(explainer schema)`<br>`(explainer schema opts)` | `(fn [instance] -> nil, or BASIC output)`. |
 | `(validate schema instance)`<br>`(validate schema instance opts)` | the verdict for one instance. |

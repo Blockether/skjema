@@ -50,6 +50,30 @@
              (is (= ["/name"] (mapv :instanceLocation (:errors (skjema/explain compiled {"name" "ab"})))))
              (is (some false? @walks)))))))
 
+;; Regression: Vis validates many definitions of one document. Each definition
+;; compiled the whole document again, 7.5 ms each and 400 ms for its 54 definitions.
+(deftest a-reference-into-a-compiled-document-compiles-nothing-again
+  (let [opts {:base "https://example.com/user.json"
+              :registry {"https://example.com/other.json" {"type" "string"}}
+              :format-assertion true}
+        document (assoc-in user-schema ["$defs" "tags"] {"type" "array" "items" {"$ref" "#/$defs/tag"}})
+        compiled (skjema/compile-schema document opts)
+        spelled (skjema/compile-schema (-> (select-keys document ["$id" "$defs"])
+                                           (assoc "$ref" "#/$defs/tags"))
+                                       opts)]
+    (with-redefs-fn {#'skjema/index-schema (fn [& _] (throw (ex-info "indexed again" {})))}
+      #(let [tag (skjema/compile-ref compiled "#/$defs/tag")
+             tags (skjema/compile-ref compiled "#/$defs/tags")
+             root (skjema/compile-ref compiled "#")]
+         (is (true? (skjema/validate tag "one")))
+         (is (false? (skjema/validate tag 7)))
+         (is (true? (skjema/validate tags ["one"])))
+         (is (true? (skjema/validate root {"name" "ada" "tags" ["one"]})))
+         (is (false? (skjema/validate root {"name" "ab"})))
+         (testing "a refusal reads as it does from the definition compiled on its own"
+           (is (= (skjema/explain spelled ["one" 7])
+                  (skjema/explain tags ["one" 7]))))))))
+
 (deftest every-error-says-where-it-happened
   (let [{:keys [valid errors]} (skjema/explain user-schema {"name" "ab" "tags" ["ok" 7]})]
     (is (false? valid))
